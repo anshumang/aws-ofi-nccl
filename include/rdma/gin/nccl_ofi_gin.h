@@ -186,6 +186,11 @@ public:
 		return rank;
 	}
 
+	int get_nranks() const
+	{
+		return nranks;
+	}
+
 	int get_dev() const
 	{
 		return dev;
