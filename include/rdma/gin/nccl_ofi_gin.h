@@ -191,6 +191,11 @@ public:
 		return nranks;
 	}
 
+	nccl_ofi_gin_allgather_comm &get_ag_comm()
+	{
+		return ag_comm;
+	}
+
 	int get_dev() const
 	{
 		return dev;
