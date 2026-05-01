@@ -348,6 +348,28 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		}
 
 		/*
+		 * Step 6b: Register SQ/doorbell MMIO regions for GPU access.
+		 * The EFA SQ buffer and doorbell are device MMIO mappings that
+		 * are not GPU-accessible by default. cudaHostRegister with
+		 * cudaHostRegisterIoMemory makes them accessible to GPU kernels.
+		 */
+		{
+			cudaError_t cu_err;
+			cu_err = cudaHostRegister(sq_attr.buffer,
+						 (size_t)sq_attr.num_entries * sq_attr.entry_size,
+						 cudaHostRegisterIoMemory);
+			if (cu_err != cudaSuccess) {
+				throw std::runtime_error("cudaHostRegister SQ buffer failed: " +
+							 std::string(cudaGetErrorString(cu_err)));
+			}
+			cu_err = cudaHostRegister(sq_attr.doorbell, 4096, cudaHostRegisterIoMemory);
+			if (cu_err != cudaSuccess) {
+				throw std::runtime_error("cudaHostRegister SQ doorbell failed: " +
+							 std::string(cudaGetErrorString(cu_err)));
+			}
+		}
+
+		/*
 		 * Step 7: Create efa-dp-direct QP and CQ device objects.
 		 */
 		struct efa_cuda_qp_attrs qp_attrs = {};
