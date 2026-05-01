@@ -78,10 +78,6 @@ libinternal_plugin_la_SOURCES = $(sources)
 libinternal_plugin_la_LDFLAGS = -static $(CUDA_LDFLAGS) $(ROCM_LDFLAGS)
 libinternal_plugin_la_LIBADD  = $(CUDA_LIBS) $(ROCM_LIBS)
 
-if HAVE_EFA_DP_DIRECT
-libinternal_plugin_la_LIBADD += -lefacudadp
-endif
-
 lib_LTLIBRARIES =
 
 if ENABLE_NEURON

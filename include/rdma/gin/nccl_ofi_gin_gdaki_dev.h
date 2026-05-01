@@ -20,13 +20,6 @@
 
 #include <stdint.h>
 
-/* Forward declarations of efa-dp-direct types. efa_cuda_dp.h is only
- * included when HAVE_EFA_DP_DIRECT is set, because the header pulls in
- * <cuda_runtime.h>. Device code that uses these fields must itself include
- * efa_cuda_dp.h. */
-struct efa_cuda_qp;
-struct efa_cuda_cq;
-
 /* Forward declaration of per-context counter/signal handles. Populated and
  * consumed only when nSignals > 0 or nCounters > 0.
  * Kept here so the device handle layout stays stable across follow-up
@@ -38,20 +31,59 @@ extern "C" {
 #endif
 
 /**
+ * GDAKI memory registration handle returned via ginHandle from regMrSym.
+ *
+ * Allocated in host memory. The lkey is used by the kernel for local SGEs.
+ * The rkeys array (one per rank) is used for remote RDMA write destinations.
+ * The kernel receives this as a ncclGinWindow_t (void*).
+ */
+struct nccl_ofi_gin_gdaki_mr_handle {
+	/* Local key for this MR on the efa-direct domain. */
+	uint32_t lkey;
+
+	/* Number of ranks (size of rkeys array). */
+	int32_t nranks;
+
+	/* Per-peer remote keys, indexed by rank. [nranks] elements follow. */
+	uint32_t rkeys[];
+};
+
+/**
+ * Raw SQ/RQ/CQ attributes from libfabric's GDA ops queries.
+ *
+ * These are the hardware attributes of the efa-direct endpoint's work queues
+ * and completion queue. NCCL's host-side code uses these to construct the
+ * device-side QP and CQ objects (e.g., via efa_cuda_create_qp/cq).
+ */
+struct nccl_ofi_gin_gdaki_wq_attrs {
+	uint8_t *buffer;
+	uint32_t entry_size;
+	uint32_t num_entries;
+	uint32_t *doorbell;
+	uint32_t max_batch;
+};
+
+struct nccl_ofi_gin_gdaki_cq_attrs {
+	uint8_t *buffer;
+	uint32_t entry_size;
+	uint32_t num_entries;
+};
+
+/**
  * Device-visible handle returned from createContext.
  *
  * This struct is allocated in GPU memory. The pointer is stored in
  * ncclNetDeviceHandle_v11_t::handle and passed to device code, which
  * dereferences it directly on the GPU.
  *
- * All member pointers refer to GPU-accessible memory.
+ * All member pointers refer to GPU-accessible memory unless noted otherwise.
  */
 struct nccl_ofi_gin_gdaki_dev_handle {
-	/* efa-dp-direct QP object (in GPU memory). */
-	struct efa_cuda_qp *qp;
-
-	/* efa-dp-direct CQ object (in GPU memory). */
-	struct efa_cuda_cq *cq;
+	/* Raw SQ, RQ, and CQ attributes from the efa-direct endpoint.
+	 * NCCL's host code uses these to create efa-dp-direct device objects. */
+	struct nccl_ofi_gin_gdaki_wq_attrs sq_attrs;
+	struct nccl_ofi_gin_gdaki_wq_attrs rq_attrs;
+	struct nccl_ofi_gin_gdaki_cq_attrs cq_attrs;
 
 	/* Per-peer address handle numbers, indexed by rank. [nranks] in GPU mem. */
 	uint16_t *address_handles;

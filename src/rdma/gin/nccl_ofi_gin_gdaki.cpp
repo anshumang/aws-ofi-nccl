@@ -15,12 +15,10 @@
 #include "nccl_ofi_api.h"
 #include "nccl_ofi_param.h"
 
-#if HAVE_EFA_DP_DIRECT && HAVE_DECL_FI_EFA_GDA_OPS
+#if HAVE_DECL_FI_EFA_GDA_OPS
 #include <cuda_runtime.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_ext_efa.h>
-
-#include <efa_cuda_dp.h>
 
 #include "rdma/gin/nccl_ofi_gin.h"
 #include "rdma/gin/nccl_ofi_gin_gdaki_ctx.h"
@@ -29,7 +27,7 @@
 #define GDAKI_ENABLED 1
 #else
 #define GDAKI_ENABLED 0
-#endif /* HAVE_EFA_DP_DIRECT && HAVE_DECL_FI_EFA_GDA_OPS */
+#endif /* HAVE_DECL_FI_EFA_GDA_OPS */
 
 bool nccl_ofi_gin_gdaki_enabled()
 {
@@ -151,20 +149,7 @@ static void gdaki_destroy_ctx(nccl_ofi_gin_gdaki_context *ctx)
 		return;
 	}
 
-	/* 1. Destroy efa-dp-direct device objects */
-	if (ctx->d_handle) {
-		/* Read back the device handle to get qp/cq pointers */
-		nccl_ofi_gin_gdaki_dev_handle h = {};
-		cudaMemcpy(&h, ctx->d_handle, sizeof(h), cudaMemcpyDeviceToHost);
-		if (h.qp) {
-			efa_cuda_destroy_qp(h.qp);
-		}
-		if (h.cq) {
-			efa_cuda_destroy_cq(h.cq);
-		}
-	}
-
-	/* 2. Free per-peer GPU arrays */
+	/* 1. Free per-peer GPU arrays */
 	cuda_free(ctx->address_handles_dev);
 	cuda_free(ctx->remote_qpns_dev);
 	cuda_free(ctx->qkey_dev);
@@ -347,35 +332,27 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		}
 
 		/*
-		 * Step 7: Create efa-dp-direct QP and CQ device objects.
+		 * Step 7: Store raw SQ/RQ/CQ attributes in the device handle
+		 * for NCCL's host code to create efa-dp-direct device objects.
 		 */
-		struct efa_cuda_qp_attrs qp_attrs = {};
-		qp_attrs.sq_buffer = sq_attr.buffer;
-		qp_attrs.rq_buffer = rq_attr.buffer;
-		qp_attrs.sq_doorbell = sq_attr.doorbell;
-		qp_attrs.rq_doorbell = rq_attr.doorbell;
-		qp_attrs.sq_num_entries = sq_attr.num_entries;
-		qp_attrs.sq_entry_size = sq_attr.entry_size;
-		qp_attrs.sq_max_batch = sq_attr.max_batch;
-		qp_attrs.rq_num_entries = rq_attr.num_entries;
-		qp_attrs.rq_entry_size = rq_attr.entry_size;
-		qp_attrs.reserved = 0;
+		nccl_ofi_gin_gdaki_wq_attrs h_sq_attrs = {};
+		h_sq_attrs.buffer = sq_attr.buffer;
+		h_sq_attrs.entry_size = sq_attr.entry_size;
+		h_sq_attrs.num_entries = sq_attr.num_entries;
+		h_sq_attrs.doorbell = sq_attr.doorbell;
+		h_sq_attrs.max_batch = sq_attr.max_batch;
 
-		struct efa_cuda_qp *d_qp = efa_cuda_create_qp(&qp_attrs, sizeof(qp_attrs));
-		if (d_qp == nullptr) {
-			throw std::runtime_error("efa_cuda_create_qp failed");
-		}
+		nccl_ofi_gin_gdaki_wq_attrs h_rq_attrs = {};
+		h_rq_attrs.buffer = rq_attr.buffer;
+		h_rq_attrs.entry_size = rq_attr.entry_size;
+		h_rq_attrs.num_entries = rq_attr.num_entries;
+		h_rq_attrs.doorbell = rq_attr.doorbell;
+		h_rq_attrs.max_batch = rq_attr.max_batch;
 
-		struct efa_cuda_cq_attrs cq_attrs = {};
-		cq_attrs.buffer = efa_cq_attr.buffer;
-		cq_attrs.num_entries = efa_cq_attr.num_entries;
-		cq_attrs.entry_size = efa_cq_attr.entry_size;
-
-		struct efa_cuda_cq *d_cq = efa_cuda_create_cq(&cq_attrs, sizeof(cq_attrs));
-		if (d_cq == nullptr) {
-			efa_cuda_destroy_qp(d_qp);
-			throw std::runtime_error("efa_cuda_create_cq failed");
-		}
+		nccl_ofi_gin_gdaki_cq_attrs h_cq_attrs = {};
+		h_cq_attrs.buffer = efa_cq_attr.buffer;
+		h_cq_attrs.entry_size = efa_cq_attr.entry_size;
+		h_cq_attrs.num_entries = efa_cq_attr.num_entries;
 
 		/*
 		 * Step 8: Allgather endpoint addresses.
@@ -453,8 +430,9 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		 * Step 11: Populate and upload the device handle.
 		 */
 		nccl_ofi_gin_gdaki_dev_handle h_handle = {};
-		h_handle.qp = d_qp;
-		h_handle.cq = d_cq;
+		h_handle.sq_attrs = h_sq_attrs;
+		h_handle.rq_attrs = h_rq_attrs;
+		h_handle.cq_attrs = h_cq_attrs;
 		h_handle.address_handles = ctx->address_handles_dev;
 		h_handle.remote_qpns = ctx->remote_qpns_dev;
 		h_handle.qkey = ctx->qkey_dev;
