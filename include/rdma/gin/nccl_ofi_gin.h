@@ -196,6 +196,9 @@ public:
 		return ag_comm;
 	}
 
+	void set_gdaki_ctx(void *ctx) { gdaki_ctx = ctx; }
+	void *get_gdaki_ctx() const { return gdaki_ctx; }
+
 	int get_dev() const
 	{
 		return dev;
@@ -330,6 +333,9 @@ private:
 
 	/* AllGather ring for metadata exchange */
 	nccl_ofi_gin_allgather_comm ag_comm;
+
+	/* GDAKI context, set by createContext. nullptr in proxy mode. */
+	void *gdaki_ctx = nullptr;
 
 	/* Remote comm info book */
 	std::vector<nccl_ofi_gin_peer_rank_info> rank_comms;

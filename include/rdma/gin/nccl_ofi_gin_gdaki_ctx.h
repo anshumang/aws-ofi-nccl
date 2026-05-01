@@ -54,6 +54,9 @@ struct nccl_ofi_gin_gdaki_context {
 	 * device code via ncclNetDeviceHandle_v11_t. */
 	struct nccl_ofi_gin_gdaki_dev_handle *d_handle;
 
+	/* GDA ops function table, retained for get_mr_lkey in regMrSym. */
+	void *gda_ops;
+
 	/* GPU memory allocations backing the per-peer arrays pointed to by
 	 * d_handle. Held here so destroyContext can free them. */
 	uint16_t *address_handles_dev;
@@ -68,6 +71,18 @@ struct nccl_ofi_gin_gdaki_context {
 	/* Cached identifiers (copied from the backing comm for convenience). */
 	int nranks;
 	int rank;
+};
+
+/**
+ * Host-side wrapper for a GDAKI memory registration.
+ *
+ * Returned as the ginHandle from regMrSym. Contains the efa-direct fid_mr
+ * (for deregistration) and the device-visible handle with lkey + rkeys.
+ */
+struct nccl_ofi_gin_gdaki_mr_reg {
+	struct fid_mr *mr;
+	/* Flexible array: nccl_ofi_gin_gdaki_mr_handle with rkeys[nranks] */
+	struct nccl_ofi_gin_gdaki_mr_handle *handle;
 };
 
 #endif /* NCCL_OFI_GIN_GDAKI_CTX_H_ */

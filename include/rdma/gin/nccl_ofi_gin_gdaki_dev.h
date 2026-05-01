@@ -38,6 +38,24 @@ extern "C" {
 #endif
 
 /**
+ * GDAKI memory registration handle returned via ginHandle from regMrSym.
+ *
+ * Allocated in host memory. The lkey is used by the kernel for local SGEs.
+ * The rkeys array (one per rank) is used for remote RDMA write destinations.
+ * The kernel receives this as a ncclGinWindow_t (void*).
+ */
+struct nccl_ofi_gin_gdaki_mr_handle {
+	/* Local key for this MR on the efa-direct domain. */
+	uint32_t lkey;
+
+	/* Number of ranks (size of rkeys array). */
+	int32_t nranks;
+
+	/* Per-peer remote keys, indexed by rank. [nranks] elements follow. */
+	uint32_t rkeys[];
+};
+
+/**
  * Device-visible handle returned from createContext.
  *
  * This struct is allocated in GPU memory. The pointer is stored in

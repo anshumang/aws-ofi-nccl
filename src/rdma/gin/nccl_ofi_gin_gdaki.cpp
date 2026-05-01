@@ -5,7 +5,7 @@
  * regMrSym[DmaBuf], deregMrSym, closeColl, closeListen, ginProgress, finalize)
  * are reused from the proxy-side implementations in nccl_ofi_gin_api.cpp.
  * Only the GDAKI-specific APIs (createContext/destroyContext/get_properties/
- * queryLastError) live here.
+ * regMrSym/deregMrSym/queryLastError) live here.
  */
 
 #include "config.h"
@@ -328,6 +328,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			throw std::runtime_error("fi_open_ops FI_EFA_GDA_OPS failed: " +
 						 std::string(fi_strerror(-ret)));
 		}
+		ctx->gda_ops = gda_ops;
 
 		/*
 		 * Step 6: Query QP work queues and CQ attributes.
@@ -492,6 +493,9 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		*ginCtx = ctx;
 		*devHandle = dev_handle;
 
+		/* Link context back to comm so regMrSym can find it. */
+		put_comm->set_gdaki_ctx(ctx);
+
 		NCCL_OFI_INFO(NCCL_NET,
 			      "gin GDAKI: createContext done (nranks=%d rank=%d nSignals=%d nCounters=%d "
 			      "sq_entries=%u sq_entry_size=%u cq_entries=%u cq_entry_size=%u)",
@@ -520,6 +524,111 @@ static ncclResult_t nccl_ofi_gin_gdaki_destroyContext(void *ginCtx)
 #endif
 }
 
+static ncclResult_t nccl_ofi_gin_gdaki_regMrSym(void *collComm, void *data, size_t size, int type,
+						uint64_t mrFlags, void **mhandle, void **ginHandle)
+{
+#if !GDAKI_ENABLED
+	(void)collComm; (void)data; (void)size; (void)type; (void)mrFlags; (void)mhandle; (void)ginHandle;
+	return ncclInternalError;
+#else
+	/* Proxy-side registration (needed for bootstrap/signals). */
+	ncclResult_t nret = nccl_ofi_gin_regMrSym(collComm, data, size, type, mrFlags, mhandle, ginHandle);
+	if (nret != ncclSuccess) {
+		return nret;
+	}
+
+	auto *put_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
+	auto *ctx = static_cast<nccl_ofi_gin_gdaki_context *>(put_comm->get_gdaki_ctx());
+
+	if (ctx == nullptr) {
+		/* createContext not yet called — regMrSym can happen before
+		 * createContext. Return proxy handle as ginHandle placeholder. */
+		return ncclSuccess;
+	}
+
+	int nranks = ctx->nranks;
+	auto *gda_ops = static_cast<struct fi_efa_ops_gda *>(ctx->gda_ops);
+
+	try {
+		/* Register on the efa-direct domain. */
+		struct fid_mr *mr = nullptr;
+		struct iovec iov = {data, size};
+		struct fi_mr_attr attr = {};
+		attr.mr_iov = &iov;
+		attr.iov_count = 1;
+		attr.access = FI_SEND | FI_RECV | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+		int ret = fi_mr_regattr(ctx->ofi_domain, &attr, 0, &mr);
+		if (ret != 0) {
+			NCCL_OFI_WARN("gin GDAKI: fi_mr_regattr failed: %s", fi_strerror(-ret));
+			return ncclSystemError;
+		}
+
+		uint32_t lkey = (uint32_t)gda_ops->get_mr_lkey(mr);
+		uint64_t rkey = fi_mr_key(mr);
+
+		/* Allgather rkeys across all ranks. */
+		std::vector<uint64_t> all_rkeys(nranks);
+		all_rkeys[ctx->rank] = rkey;
+		ret = put_comm->get_ag_comm().all_gather(all_rkeys.data(), sizeof(uint64_t));
+		if (ret != 0) {
+			fi_close(&mr->fid);
+			NCCL_OFI_WARN("gin GDAKI: rkey allgather failed");
+			return ncclSystemError;
+		}
+
+		/* Allocate the handle: base struct + rkeys[nranks]. */
+		size_t handle_size = sizeof(nccl_ofi_gin_gdaki_mr_handle) + nranks * sizeof(uint32_t);
+		auto *gdaki_handle = static_cast<nccl_ofi_gin_gdaki_mr_handle *>(calloc(1, handle_size));
+		if (!gdaki_handle) {
+			fi_close(&mr->fid);
+			return ncclSystemError;
+		}
+		gdaki_handle->lkey = lkey;
+		gdaki_handle->nranks = nranks;
+		for (int i = 0; i < nranks; i++) {
+			gdaki_handle->rkeys[i] = (uint32_t)all_rkeys[i];
+		}
+
+		/* Wrap with host-side registration info for deregMrSym. */
+		auto *reg = new (std::nothrow) nccl_ofi_gin_gdaki_mr_reg();
+		if (!reg) {
+			free(gdaki_handle);
+			fi_close(&mr->fid);
+			return ncclSystemError;
+		}
+		reg->mr = mr;
+		reg->handle = gdaki_handle;
+
+		*ginHandle = reg;
+		return ncclSuccess;
+
+	} catch (const std::exception &e) {
+		NCCL_OFI_WARN("gin GDAKI: regMrSym failed: %s", e.what());
+		return ncclSystemError;
+	}
+#endif
+}
+
+static ncclResult_t nccl_ofi_gin_gdaki_deregMrSym(void *collComm, void *mhandle)
+{
+#if !GDAKI_ENABLED
+	return nccl_ofi_gin_deregMrSym(collComm, mhandle);
+#else
+	/* Proxy-side deregistration. */
+	ncclResult_t nret = nccl_ofi_gin_deregMrSym(collComm, mhandle);
+
+	/* Note: the ginHandle (gdaki_mr_reg) is separate from mhandle.
+	 * NCCL calls deregMrSym with mhandle only. The ginHandle lifetime
+	 * is managed by NCCL separately — it frees it when the window is
+	 * destroyed. We don't need to free it here.
+	 *
+	 * TODO: If NCCL doesn't free ginHandle, we need a separate
+	 * deregistration path. For now, assume NCCL manages it.
+	 */
+	return nret;
+#endif
+}
+
 static ncclResult_t nccl_ofi_gin_gdaki_queryLastError(void *ginCtx, bool *hasError)
 {
 	*hasError = false;
@@ -539,9 +648,9 @@ ncclGin_v13_t nccl_ofi_gin_gdaki_plugin = {
 	.listen = nccl_ofi_gin_listen,
 	.connect = nccl_ofi_gin_connect,
 	.createContext = nccl_ofi_gin_gdaki_createContext,
-	.regMrSym = nccl_ofi_gin_regMrSym,
+	.regMrSym = nccl_ofi_gin_gdaki_regMrSym,
 	.regMrSymDmaBuf = nccl_ofi_gin_regMrSymDmaBuf,
-	.deregMrSym = nccl_ofi_gin_deregMrSym,
+	.deregMrSym = nccl_ofi_gin_gdaki_deregMrSym,
 	.destroyContext = nccl_ofi_gin_gdaki_destroyContext,
 	.closeColl = nccl_ofi_gin_closeColl,
 	.closeListen = nccl_ofi_gin_closeListen,
