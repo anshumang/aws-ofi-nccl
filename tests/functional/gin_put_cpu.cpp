@@ -253,6 +253,8 @@ int main(int argc, char *argv[])
 	auto *ctx = static_cast<nccl_ofi_gin_gdaki_context *>(proxyCtx);
 
 #if HAVE_DECL_FI_EFA_GDA_OPS
+	auto *ctx = static_cast<nccl_ofi_gin_gdaki_context *>(proxyCtx);
+
 	/* Read device handle to get SQ/CQ attrs and per-peer addressing */
 	nccl_ofi_gin_gdaki_dev_handle h_dev = {};
 	CUDACHECK(cudaMemcpy(&h_dev, devHandle->handle, sizeof(h_dev), cudaMemcpyDeviceToHost));
