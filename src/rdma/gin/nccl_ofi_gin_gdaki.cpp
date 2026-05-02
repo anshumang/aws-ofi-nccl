@@ -16,12 +16,12 @@
 #include "nccl_ofi_param.h"
 
 #if HAVE_DECL_FI_EFA_GDA_OPS
-#include <cuda_runtime.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_ext_efa.h>
 
 #include "rdma/gin/nccl_ofi_gin.h"
 #include "rdma/gin/nccl_ofi_gin_gdaki_ctx.h"
+#include "nccl_ofi_cuda.h"
 #include "nccl_ofi_ofiutils.h"
 
 #define GDAKI_ENABLED 1
@@ -60,7 +60,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_get_properties(int dev, ncclNetProperties
 	props->latency = ofi_properties.latency;
 	props->maxComms = ofi_properties.max_communicators;
 	props->maxRecvs = ofi_properties.max_group_receives;
-	props->netDeviceType = NCCL_NET_DEVICE_GIN_GDAKI;
+	props->netDeviceType = NCCL_NET_DEVICE_GIN_EFA_GDAKI;
 	props->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
 	props->vProps.ndevs = 1;
 	props->vProps.devs[0] = dev;
@@ -113,30 +113,33 @@ static struct fi_info *get_gdaki_info(const char *domain_name)
 }
 
 /*
- * Helper: CUDA-allocate and zero a buffer. Returns nullptr on failure.
+ * Helper: GPU-allocate and zero a buffer using plugin CUDA wrappers.
  */
-static void *cuda_alloc_zeroed(size_t size)
+static void *gpu_alloc_zeroed(size_t size)
 {
 	void *ptr = nullptr;
-	cudaError_t err = cudaMalloc(&ptr, size);
-	if (err != cudaSuccess) {
+	if (nccl_net_ofi_gpu_mem_alloc(&ptr, size) != 0) {
 		return nullptr;
 	}
-	err = cudaMemset(ptr, 0, size);
-	if (err != cudaSuccess) {
-		cudaFree(ptr);
+	/* cuMemAlloc doesn't zero — use memcpy of a zeroed host buffer */
+	void *zeros = calloc(1, size);
+	if (!zeros) {
+		nccl_net_ofi_gpu_mem_free(ptr);
 		return nullptr;
 	}
+	if (nccl_net_ofi_gpu_mem_copy_host_to_device(ptr, zeros, size) != 0) {
+		free(zeros);
+		nccl_net_ofi_gpu_mem_free(ptr);
+		return nullptr;
+	}
+	free(zeros);
 	return ptr;
 }
 
-/*
- * Helper: free a CUDA pointer if non-null.
- */
-static void cuda_free(void *ptr)
+static void gpu_free(void *ptr)
 {
 	if (ptr) {
-		cudaFree(ptr);
+		nccl_net_ofi_gpu_mem_free(ptr);
 	}
 }
 
@@ -150,22 +153,26 @@ static void gdaki_destroy_ctx(nccl_ofi_gin_gdaki_context *ctx)
 	}
 
 	/* 1. Free per-peer GPU arrays */
-	cuda_free(ctx->address_handles_dev);
-	cuda_free(ctx->remote_qpns_dev);
-	cuda_free(ctx->qkey_dev);
+	gpu_free(ctx->address_handles_dev);
+	gpu_free(ctx->remote_qpns_dev);
+	gpu_free(ctx->qkey_dev);
+
+	/* 2. Free QP and CQ GPU allocations */
+	gpu_free(ctx->d_qp);
+	gpu_free(ctx->d_cq);
 
 	/* 3. Free device handle struct */
-	cuda_free(ctx->d_handle);
+	gpu_free(ctx->d_handle);
 
 	/* 4. Deregister and free SQ/CQ GPU buffers */
 	if (ctx->sq_mr) {
 		fi_close(&ctx->sq_mr->fid);
 	}
-	cuda_free(ctx->sq_buffer_dev);
+	gpu_free(ctx->sq_buffer_dev);
 	if (ctx->cq_mr) {
 		fi_close(&ctx->cq_mr->fid);
 	}
-	cuda_free(ctx->cq_buffer_dev);
+	gpu_free(ctx->cq_buffer_dev);
 
 	/* 5. Close libfabric resources (order matters: ep before cq/av/domain/fabric) */
 	if (ctx->ofi_ep) {
@@ -332,27 +339,75 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		}
 
 		/*
-		 * Step 7: Store raw SQ/RQ/CQ attributes in the device handle
-		 * for NCCL's host code to create efa-dp-direct device objects.
+		 * Step 7: Register SQ MMIO regions for GPU access.
+		 * The SQ buffer and doorbell are device MMIO (BAR) regions that
+		 * require cuMemHostRegister with IOMEMORY | DEVICEMAP for GPU
+		 * kernels to write WQEs and ring the doorbell.
+		 *
+		 * TODO: RQ buffer registration as DEVICEMAP works.
+		 * Revisit when RDMA_READ is implemented.
+		 *
+		 * TODO: CQ buffer registration fails with both IOMEMORY and
+		 * DEVICEMAP on the current p5en cluster. The host pointer
+		 * works for both CPU and GPU CQ polling.
 		 */
-		nccl_ofi_gin_gdaki_wq_attrs h_sq_attrs = {};
-		h_sq_attrs.buffer = sq_attr.buffer;
-		h_sq_attrs.entry_size = sq_attr.entry_size;
-		h_sq_attrs.num_entries = sq_attr.num_entries;
-		h_sq_attrs.doorbell = sq_attr.doorbell;
-		h_sq_attrs.max_batch = sq_attr.max_batch;
+		void *d_sq_buf = nullptr, *d_sq_db = nullptr;
 
-		nccl_ofi_gin_gdaki_wq_attrs h_rq_attrs = {};
-		h_rq_attrs.buffer = rq_attr.buffer;
-		h_rq_attrs.entry_size = rq_attr.entry_size;
-		h_rq_attrs.num_entries = rq_attr.num_entries;
-		h_rq_attrs.doorbell = rq_attr.doorbell;
-		h_rq_attrs.max_batch = rq_attr.max_batch;
+		if (nccl_net_ofi_gpu_host_register_iomem(sq_attr.buffer,
+				(size_t)sq_attr.num_entries * sq_attr.entry_size) != 0)
+			throw std::runtime_error("host_register SQ buffer failed");
+		if (nccl_net_ofi_gpu_host_get_device_pointer(&d_sq_buf, sq_attr.buffer) != 0)
+			throw std::runtime_error("get_device_pointer SQ buffer failed");
 
-		nccl_ofi_gin_gdaki_cq_attrs h_cq_attrs = {};
-		h_cq_attrs.buffer = efa_cq_attr.buffer;
-		h_cq_attrs.entry_size = efa_cq_attr.entry_size;
-		h_cq_attrs.num_entries = efa_cq_attr.num_entries;
+		if (nccl_net_ofi_gpu_host_register_iomem(sq_attr.doorbell, 4096) != 0)
+			throw std::runtime_error("host_register SQ doorbell failed");
+		if (nccl_net_ofi_gpu_host_get_device_pointer(&d_sq_db, sq_attr.doorbell) != 0)
+			throw std::runtime_error("get_device_pointer SQ doorbell failed");
+
+		/* Build QP struct (layout-compatible with efa_cuda_qp) */
+		nccl_ofi_gin_gdaki_qp h_qp = {};
+		h_qp.sq.wq.buf = (uint8_t *)d_sq_buf;
+		h_qp.sq.wq.db = (uint32_t *)d_sq_db;
+		h_qp.sq.wq.max_wqes = sq_attr.num_entries;
+		h_qp.sq.wq.queue_mask = sq_attr.num_entries - 1;
+		h_qp.sq.wq.queue_size_shift = __builtin_ctz(sq_attr.num_entries);
+		h_qp.sq.wq.max_batch = sq_attr.max_batch;
+		h_qp.sq.wq.phase = 0;
+		h_qp.sq.max_inline_data = 32;
+		h_qp.sq.max_rdma_sges = 2;
+		h_qp.rq.wq.buf = rq_attr.buffer;
+		h_qp.rq.wq.db = rq_attr.doorbell;
+		h_qp.rq.wq.max_wqes = rq_attr.num_entries;
+		h_qp.rq.wq.queue_mask = rq_attr.num_entries - 1;
+		h_qp.rq.wq.queue_size_shift = __builtin_ctz(rq_attr.num_entries);
+		h_qp.rq.wq.max_batch = rq_attr.num_entries;
+		h_qp.rq.wq.phase = 1;
+
+		/* Build CQ struct (layout-compatible with efa_cuda_cq) */
+		nccl_ofi_gin_gdaki_cq h_cq = {};
+		h_cq.buf = efa_cq_attr.buffer;
+		h_cq.entry_size = efa_cq_attr.entry_size;
+		h_cq.num_entries = efa_cq_attr.num_entries;
+		h_cq.queue_mask = efa_cq_attr.num_entries - 1;
+		h_cq.queue_size_shift = __builtin_ctz(efa_cq_attr.num_entries);
+		h_cq.phase = 1;
+
+		/* Upload QP and CQ to GPU */
+		nccl_ofi_gin_gdaki_qp *d_qp = nullptr;
+		if (nccl_net_ofi_gpu_mem_alloc((void **)&d_qp, sizeof(h_qp)) != 0)
+			throw std::runtime_error("gpu_mem_alloc QP failed");
+		if (nccl_net_ofi_gpu_mem_copy_host_to_device(d_qp, &h_qp, sizeof(h_qp)) != 0)
+			throw std::runtime_error("gpu_mem_copy QP failed");
+
+		nccl_ofi_gin_gdaki_cq *d_cq = nullptr;
+		if (nccl_net_ofi_gpu_mem_alloc((void **)&d_cq, sizeof(h_cq)) != 0)
+			throw std::runtime_error("gpu_mem_alloc CQ failed");
+		if (nccl_net_ofi_gpu_mem_copy_host_to_device(d_cq, &h_cq, sizeof(h_cq)) != 0)
+			throw std::runtime_error("gpu_mem_copy CQ failed");
+
+		/* Store in ctx for teardown */
+		ctx->d_qp = d_qp;
+		ctx->d_cq = d_cq;
 
 		/*
 		 * Step 8: Allgather endpoint addresses.
@@ -411,28 +466,27 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		size_t qpn_size = nranks * sizeof(uint16_t);
 		size_t qkey_size = nranks * sizeof(uint32_t);
 
-		ctx->address_handles_dev = static_cast<uint16_t *>(cuda_alloc_zeroed(ahn_size));
-		ctx->remote_qpns_dev = static_cast<uint16_t *>(cuda_alloc_zeroed(qpn_size));
-		ctx->qkey_dev = static_cast<uint32_t *>(cuda_alloc_zeroed(qkey_size));
+		ctx->address_handles_dev = static_cast<uint16_t *>(gpu_alloc_zeroed(ahn_size));
+		ctx->remote_qpns_dev = static_cast<uint16_t *>(gpu_alloc_zeroed(qpn_size));
+		ctx->qkey_dev = static_cast<uint32_t *>(gpu_alloc_zeroed(qkey_size));
 		if (!ctx->address_handles_dev || !ctx->remote_qpns_dev || !ctx->qkey_dev) {
-			throw std::runtime_error("cudaMalloc for per-peer arrays failed");
+			throw std::runtime_error("gpu_alloc for per-peer arrays failed");
 		}
 
-		cudaError_t cu_ret;
-		cu_ret = cudaMemcpy(ctx->address_handles_dev, h_ahns.data(), ahn_size, cudaMemcpyHostToDevice);
-		if (cu_ret != cudaSuccess) throw std::runtime_error("cudaMemcpy ahns failed");
-		cu_ret = cudaMemcpy(ctx->remote_qpns_dev, h_qpns.data(), qpn_size, cudaMemcpyHostToDevice);
-		if (cu_ret != cudaSuccess) throw std::runtime_error("cudaMemcpy qpns failed");
-		cu_ret = cudaMemcpy(ctx->qkey_dev, h_qkeys.data(), qkey_size, cudaMemcpyHostToDevice);
-		if (cu_ret != cudaSuccess) throw std::runtime_error("cudaMemcpy qkeys failed");
+		int mc_ret;
+		mc_ret = nccl_net_ofi_gpu_mem_copy_host_to_device(ctx->address_handles_dev, h_ahns.data(), ahn_size);
+		if (mc_ret) throw std::runtime_error("memcpy ahns failed");
+		mc_ret = nccl_net_ofi_gpu_mem_copy_host_to_device(ctx->remote_qpns_dev, h_qpns.data(), qpn_size);
+		if (mc_ret) throw std::runtime_error("memcpy qpns failed");
+		mc_ret = nccl_net_ofi_gpu_mem_copy_host_to_device(ctx->qkey_dev, h_qkeys.data(), qkey_size);
+		if (mc_ret) throw std::runtime_error("memcpy qkeys failed");
 
 		/*
 		 * Step 11: Populate and upload the device handle.
 		 */
 		nccl_ofi_gin_gdaki_dev_handle h_handle = {};
-		h_handle.sq_attrs = h_sq_attrs;
-		h_handle.rq_attrs = h_rq_attrs;
-		h_handle.cq_attrs = h_cq_attrs;
+		h_handle.qp = d_qp;
+		h_handle.cq = d_cq;
 		h_handle.address_handles = ctx->address_handles_dev;
 		h_handle.remote_qpns = ctx->remote_qpns_dev;
 		h_handle.qkey = ctx->qkey_dev;
@@ -443,13 +497,12 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		h_handle.rank = rank;
 
 		ctx->d_handle = static_cast<nccl_ofi_gin_gdaki_dev_handle *>(
-			cuda_alloc_zeroed(sizeof(nccl_ofi_gin_gdaki_dev_handle)));
+			gpu_alloc_zeroed(sizeof(nccl_ofi_gin_gdaki_dev_handle)));
 		if (!ctx->d_handle) {
-			throw std::runtime_error("cudaMalloc for device handle failed");
+			throw std::runtime_error("gpu_alloc for device handle failed");
 		}
-		cu_ret = cudaMemcpy(ctx->d_handle, &h_handle, sizeof(h_handle), cudaMemcpyHostToDevice);
-		if (cu_ret != cudaSuccess) {
-			throw std::runtime_error("cudaMemcpy device handle failed");
+		if (nccl_net_ofi_gpu_mem_copy_host_to_device(ctx->d_handle, &h_handle, sizeof(h_handle)) != 0) {
+			throw std::runtime_error("gpu_mem_copy device handle failed");
 		}
 
 		/*
@@ -461,7 +514,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			throw std::runtime_error("calloc ncclNetDeviceHandle failed");
 		}
 
-		dev_handle->netDeviceType = NCCL_NET_DEVICE_GIN_GDAKI;
+		dev_handle->netDeviceType = NCCL_NET_DEVICE_GIN_EFA_GDAKI;
 		dev_handle->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
 		dev_handle->handle = ctx->d_handle;
 		dev_handle->size = sizeof(nccl_ofi_gin_gdaki_dev_handle);

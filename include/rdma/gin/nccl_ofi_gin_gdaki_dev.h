@@ -49,24 +49,68 @@ struct nccl_ofi_gin_gdaki_mr_handle {
 };
 
 /**
- * Raw SQ/RQ/CQ attributes from libfabric's GDA ops queries.
+ * Work queue descriptor, layout-compatible with efa_cuda_wq from efa-dp-direct.
  *
- * These are the hardware attributes of the efa-direct endpoint's work queues
- * and completion queue. NCCL's host-side code uses these to construct the
- * device-side QP and CQ objects (e.g., via efa_cuda_create_qp/cq).
+ * The kernel-side code (in NCCL's transport/net_efa) casts this to
+ * efa_cuda_wq* for use with efa-dp-direct device functions.
  */
-struct nccl_ofi_gin_gdaki_wq_attrs {
-	uint8_t *buffer;
-	uint32_t entry_size;
-	uint32_t num_entries;
-	uint32_t *doorbell;
+struct nccl_ofi_gin_gdaki_wq {
+	uint32_t max_sge;
+	uint32_t max_wqes;
+	uint32_t queue_mask;
+	uint32_t queue_size_shift;
 	uint32_t max_batch;
+	uint32_t wqes_pending;
+	uint32_t wqes_posted;
+	uint32_t wqes_completed;
+	uint32_t pc;
+	int phase;
+	uint8_t *buf;
+	uint32_t *db;
 };
 
-struct nccl_ofi_gin_gdaki_cq_attrs {
-	uint8_t *buffer;
+/**
+ * Send queue descriptor, layout-compatible with efa_cuda_sq.
+ */
+struct nccl_ofi_gin_gdaki_sq {
+	struct nccl_ofi_gin_gdaki_wq wq;
+	uint32_t max_inline_data;
+	uint32_t max_rdma_sges;
+};
+
+/**
+ * Receive queue descriptor, layout-compatible with efa_cuda_rq.
+ */
+struct nccl_ofi_gin_gdaki_rq {
+	struct nccl_ofi_gin_gdaki_wq wq;
+};
+
+/**
+ * QP descriptor, layout-compatible with efa_cuda_qp.
+ * Allocated in GPU memory by createContext. The kernel casts this to
+ * efa_cuda_qp* for use with efa-dp-direct device functions.
+ */
+struct nccl_ofi_gin_gdaki_qp {
+	uint64_t comp_mask;
+	struct nccl_ofi_gin_gdaki_sq sq;
+	struct nccl_ofi_gin_gdaki_rq rq;
+};
+
+/**
+ * CQ descriptor, layout-compatible with efa_cuda_cq.
+ * Allocated in GPU memory by createContext. The kernel casts this to
+ * efa_cuda_cq* for use with efa-dp-direct device functions.
+ */
+struct nccl_ofi_gin_gdaki_cq {
+	uint64_t comp_mask;
 	uint32_t entry_size;
 	uint32_t num_entries;
+	uint32_t queue_mask;
+	uint32_t queue_size_shift;
+	uint32_t cc;
+	int phase;
+	uint8_t *buf;
+	uint32_t *db;
 };
 
 /**
@@ -76,14 +120,14 @@ struct nccl_ofi_gin_gdaki_cq_attrs {
  * ncclNetDeviceHandle_v11_t::handle and passed to device code, which
  * dereferences it directly on the GPU.
  *
- * All member pointers refer to GPU-accessible memory unless noted otherwise.
+ * All member pointers refer to GPU-accessible memory.
  */
 struct nccl_ofi_gin_gdaki_dev_handle {
-	/* Raw SQ, RQ, and CQ attributes from the efa-direct endpoint.
-	 * NCCL's host code uses these to create efa-dp-direct device objects. */
-	struct nccl_ofi_gin_gdaki_wq_attrs sq_attrs;
-	struct nccl_ofi_gin_gdaki_wq_attrs rq_attrs;
-	struct nccl_ofi_gin_gdaki_cq_attrs cq_attrs;
+	/* GPU-resident QP descriptor (layout-compatible with efa_cuda_qp). */
+	struct nccl_ofi_gin_gdaki_qp *qp;
+
+	/* GPU-resident CQ descriptor (layout-compatible with efa_cuda_cq). */
+	struct nccl_ofi_gin_gdaki_cq *cq;
 
 	/* Per-peer address handle numbers, indexed by rank. [nranks] in GPU mem. */
 	uint16_t *address_handles;
@@ -104,8 +148,7 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 	 * Initialized to 0. */
 	uint64_t pending_reqs;
 
-	/* Number of ranks participating in this context. Useful for kernel-
-	 * side bounds checks on the per-peer arrays. */
+	/* Number of ranks participating in this context. */
 	int32_t nranks;
 
 	/* Rank of the local process within the context. */

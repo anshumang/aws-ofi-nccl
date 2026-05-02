@@ -59,6 +59,14 @@ int nccl_net_ofi_gpu_mem_copy_host_to_device(void *dst, void *src, size_t size);
 int nccl_net_ofi_gpu_host_register_iomem(void *ptr, size_t size);
 
 /*
+ * @brief wraps cuMemHostRegister() with CU_MEMHOSTREGISTER_DEVICEMAP only.
+ *        Registers a host DMA-able region (not MMIO) for GPU access.
+ * @return	0 on success
+ *		-1 on error
+ */
+int nccl_net_ofi_gpu_host_register_devicemap(void *ptr, size_t size);
+
+/*
  * @brief wraps cuMemHostUnregister()
  * @return	0 on success
  *		-1 on error

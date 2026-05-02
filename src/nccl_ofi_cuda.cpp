@@ -231,6 +231,12 @@ int nccl_net_ofi_gpu_host_register_iomem(void *ptr, size_t size)
 	return ret == CUDA_SUCCESS ? 0 : -EINVAL;
 }
 
+int nccl_net_ofi_gpu_host_register_devicemap(void *ptr, size_t size)
+{
+	CUresult ret = pfn_cuMemHostRegister(ptr, size, CU_MEMHOSTREGISTER_DEVICEMAP);
+	return ret == CUDA_SUCCESS ? 0 : -EINVAL;
+}
+
 int nccl_net_ofi_gpu_host_unregister(void *ptr)
 {
 	CUresult ret = pfn_cuMemHostUnregister(ptr);

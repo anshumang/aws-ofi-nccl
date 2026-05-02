@@ -54,6 +54,10 @@ struct nccl_ofi_gin_gdaki_context {
 	 * device code via ncclNetDeviceHandle_v11_t. */
 	struct nccl_ofi_gin_gdaki_dev_handle *d_handle;
 
+	/* GPU-resident QP and CQ objects, stored here for teardown. */
+	void *d_qp;
+	void *d_cq;
+
 	/* GPU memory allocations backing the per-peer arrays pointed to by
 	 * d_handle. Held here so destroyContext can free them. */
 	uint16_t *address_handles_dev;

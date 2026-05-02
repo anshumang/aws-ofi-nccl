@@ -250,20 +250,15 @@ int main(int argc, char *argv[])
 	 * and register MRs. The context struct layout starts with:
 	 *   fid_fabric*, fid_domain*, fid_ep*, fid_av*, fid_cq*, fi_info*
 	 */
-	auto *ctx = static_cast<nccl_ofi_gin_gdaki_context *>(proxyCtx);
 
 #if HAVE_DECL_FI_EFA_GDA_OPS
 	auto *ctx = static_cast<nccl_ofi_gin_gdaki_context *>(proxyCtx);
 
-	/* Read device handle to get SQ/CQ attrs and per-peer addressing */
+	/* Read device handle to get per-peer addressing */
 	nccl_ofi_gin_gdaki_dev_handle h_dev = {};
 	CUDACHECK(cudaMemcpy(&h_dev, devHandle->handle, sizeof(h_dev), cudaMemcpyDeviceToHost));
 
-	NCCL_OFI_INFO(NCCL_NET, "Rank %d: SQ entries=%u entry_size=%u CQ entries=%u entry_size=%u",
-		      rank, h_dev.sq_attrs.num_entries, h_dev.sq_attrs.entry_size,
-		      h_dev.cq_attrs.num_entries, h_dev.cq_attrs.entry_size);
-
-	/* Open GDA ops for get_mr_lkey */
+	/* Open GDA ops for MR registration and direct SQ/CQ access */
 	struct fi_efa_ops_gda *gda_ops = nullptr;
 	int ret = fi_open_ops(&ctx->ofi_domain->fid, FI_EFA_GDA_OPS, 0, (void **)&gda_ops, nullptr);
 	if (ret != 0 || !gda_ops) {
@@ -271,6 +266,19 @@ int main(int argc, char *argv[])
 		MPI_Finalize();
 		return 1;
 	}
+
+	/* Query SQ/CQ attrs for CPU-side direct access (host pointers) */
+	struct fi_efa_wq_attr sq_attr = {}, rq_attr = {};
+	ret = gda_ops->query_qp_wqs(ctx->ofi_ep, &sq_attr, &rq_attr);
+	if (ret != 0) { NCCL_OFI_WARN("query_qp_wqs failed"); MPI_Finalize(); return 1; }
+
+	struct fi_efa_cq_attr efa_cq_attr = {};
+	ret = gda_ops->query_cq(ctx->ofi_cq, &efa_cq_attr);
+	if (ret != 0) { NCCL_OFI_WARN("query_cq failed"); MPI_Finalize(); return 1; }
+
+	NCCL_OFI_INFO(NCCL_NET, "Rank %d: SQ entries=%u entry_size=%u CQ entries=%u entry_size=%u",
+		      rank, sq_attr.num_entries, sq_attr.entry_size,
+		      efa_cq_attr.num_entries, efa_cq_attr.entry_size);
 
 	/* Allocate and register test buffers (host memory for CPU test) */
 	const size_t BUF_SIZE = 64;
@@ -347,27 +355,28 @@ int main(int argc, char *argv[])
 		local->buf_addr_hi = (uint32_t)((uint64_t)src_buf >> 32);
 
 		/* Write WQE to SQ MMIO buffer */
-		uint32_t sq_mask = h_dev.sq_attrs.num_entries - 1;
+		uint32_t sq_mask = sq_attr.num_entries - 1;
 		uint32_t pc = 0; /* first WQE */
 		uint32_t sq_offset = (pc & sq_mask) * sizeof(struct efa_io_tx_wqe);
-		mmio_memcpy_x64(h_dev.sq_attrs.buffer + sq_offset, &wqe, sizeof(wqe));
+		mmio_memcpy_x64(sq_attr.buffer + sq_offset, &wqe, sizeof(wqe));
 
 		/* Ring doorbell */
 		pc = 1;
 		mmio_flush_writes();
-		mmio_write32(h_dev.sq_attrs.doorbell, pc);
+		mmio_write32(sq_attr.doorbell, pc);
 		mmio_flush_writes();
 
 		NCCL_OFI_INFO(NCCL_NET, "R0: WQE posted, polling CQ...");
 
 		/* Poll CQ */
-		uint32_t cq_mask = h_dev.cq_attrs.num_entries - 1;
+		uint32_t cq_mask = efa_cq_attr.num_entries - 1;
 		uint32_t cq_idx = 0;
 		volatile struct efa_io_cdesc_common *cqe =
-			(volatile struct efa_io_cdesc_common *)(h_dev.cq_attrs.buffer + (cq_idx & cq_mask) * h_dev.cq_attrs.entry_size);
+			reinterpret_cast<volatile struct efa_io_cdesc_common *>(
+				efa_cq_attr.buffer + (cq_idx & cq_mask) * efa_cq_attr.entry_size);
 
 		NCCL_OFI_INFO(NCCL_NET, "R0: CQ buf=%p entry_size=%u num_entries=%u cqe=%p initial_flags=0x%02x",
-			      h_dev.cq_attrs.buffer, h_dev.cq_attrs.entry_size, h_dev.cq_attrs.num_entries,
+			      efa_cq_attr.buffer, efa_cq_attr.entry_size, efa_cq_attr.num_entries,
 			      cqe, cqe->flags);
 
 		bool got_completion = false;
