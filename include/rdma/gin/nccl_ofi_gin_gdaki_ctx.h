@@ -19,6 +19,38 @@
 #include "rdma/gin/nccl_ofi_gin_gdaki_dev.h"
 
 /**
+ * Host-side state for a single signal or counter endpoint.
+ *
+ * Each signal/counter gets its own efa-direct endpoint with two hardware
+ * counters (FI_WRITE for local completion, FI_REMOTE_WRITE for remote
+ * notification). The libfabric fids and GPU allocations are tracked here
+ * for teardown.
+ */
+struct nccl_ofi_gin_gdaki_sc_endpoint {
+	struct fid_ep *ep;
+	struct fid_cq *cq;
+	struct fid_cntr *write_cntr;       /* FI_WRITE counter (local completion) */
+	struct fid_cntr *remote_write_cntr; /* FI_REMOTE_WRITE counter (signal) */
+
+	/* GPU-accessible counter value memory (allocated via cuMemAlloc).
+	 * The NIC writes directly to these via cntr_open_ext external memory. */
+	void *d_write_cntr_mem;
+	void *d_remote_write_cntr_mem;
+
+	/* GPU-resident QP and CQ structs for this endpoint. */
+	void *d_qp;
+	void *d_cq;
+
+	/* GPU-resident device handle for this endpoint. */
+	struct nccl_ofi_gin_dev_counter_handle *d_dev_handle;
+
+	/* GPU-resident per-peer arrays for this endpoint. */
+	uint16_t *d_address_handles;
+	uint16_t *d_remote_qpns;
+	uint32_t *d_qkey;
+};
+
+/**
  * Host-side state associated with a single createContext call.
  *
  * createContext returns a pointer to this struct as the opaque ginCtx.
@@ -64,8 +96,16 @@ struct nccl_ofi_gin_gdaki_context {
 	uint16_t *remote_qpns_dev;
 	uint32_t *qkey_dev;
 
-	/* Config fields stashed for later use when signals and counters
-	 * are enabled. Unused until then. */
+	/* Signal/counter endpoints. n_sc_endpoints == MAX(nSignals, nCounters).
+	 * NULL when nSignals == 0 && nCounters == 0. */
+	struct nccl_ofi_gin_gdaki_sc_endpoint *sc_endpoints;
+	int n_sc_endpoints;
+
+	/* GPU-resident arrays of device handle pointers for signal_handles
+	 * and counter_handles in the device handle. */
+	struct nccl_ofi_gin_dev_counter_handle **d_signal_handles;
+	struct nccl_ofi_gin_dev_counter_handle **d_counter_handles;
+
 	int nSignals;
 	int nCounters;
 

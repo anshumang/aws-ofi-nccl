@@ -20,11 +20,37 @@
 
 #include <stdint.h>
 
-/* Forward declaration of per-context counter/signal handles. Populated and
- * consumed only when nSignals > 0 or nCounters > 0.
- * Kept here so the device handle layout stays stable across follow-up
- * patches that enable signals and counters. */
-struct nccl_ofi_gin_dev_counter_handle;
+/**
+ * Per-signal/counter endpoint handle, visible to device code.
+ *
+ * Each signal or counter endpoint has its own QP (with SQ for posting)
+ * and per-peer addressing arrays. The hardware counter value lives in
+ * GPU memory and is updated by the NIC directly.
+ *
+ * For signals: the GPU kernel reads *cntr_value to detect remote writes
+ *              (FI_REMOTE_WRITE counter). The per-peer arrays let the
+ *              sender target this QP on the remote rank.
+ *
+ * For counters: the GPU kernel reads *cntr_value to track local write
+ *               completions (FI_WRITE counter). The QP is used by the
+ *               local rank to post writes that need completion tracking.
+ */
+struct nccl_ofi_gin_dev_counter_handle {
+	/* GPU-resident QP for this signal/counter endpoint. */
+	struct nccl_ofi_gin_gdaki_qp *qp;
+
+	/* GPU-resident CQ for this signal/counter endpoint. */
+	struct nccl_ofi_gin_gdaki_cq *cq;
+
+	/* Pointer to the hardware counter value in GPU-accessible memory.
+	 * For signals: FI_REMOTE_WRITE count. For counters: FI_WRITE count. */
+	volatile uint64_t *cntr_value;
+
+	/* Per-peer addressing for this endpoint's QP. [nranks] in GPU mem. */
+	uint16_t *address_handles;
+	uint16_t *remote_qpns;
+	uint32_t *qkey;
+};
 
 #ifdef __cplusplus
 extern "C" {
