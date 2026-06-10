@@ -190,7 +190,6 @@ static std::vector<uint8_t> allgather_ep_addr(struct fid_ep *ep,
  * caller's catch handler unwinds via the ctx's RAII members.
  */
 static void setup_scratch_buffer(nccl_ofi_gin_gdaki_context *ctx,
-				 struct fid_domain *ofi_domain,
 				 nccl_ofi_rdma_gin_put_comm *put_comm,
 				 int nranks, int rank)
 {
@@ -199,50 +198,65 @@ static void setup_scratch_buffer(nccl_ofi_gin_gdaki_context *ctx,
 	if (ctx->scratch_buf == nullptr) {
 		throw std::runtime_error("scratch calloc failed");
 	}
-
-	struct iovec iov = { .iov_base = ctx->scratch_buf,
-			     .iov_len = kScratchBytes };
-	struct fi_mr_attr mr_attr = {};
-	mr_attr.mr_iov = &iov;
-	mr_attr.iov_count = 1;
-	/* The buffer is only used as the source/target of RDMA WRITE on the
-	 * signal endpoints; FI_SEND / FI_RECV are not required. */
-	mr_attr.access = FI_REMOTE_WRITE | FI_WRITE;
-	mr_attr.iface = FI_HMEM_SYSTEM;
-
-	int mret = fi_mr_regattr(ofi_domain, &mr_attr, 0, &ctx->scratch_mr);
-	if (mret != 0) {
-		throw std::runtime_error(
-			"scratch fi_mr_regattr failed: " +
-			std::string(fi_strerror(-mret)));
-	}
-
-	ctx->scratch_lkey = (uint32_t)fi_mr_key(ctx->scratch_mr);
 	ctx->scratch_local_addr = (uint64_t)ctx->scratch_buf;
 
-	/* Allgather (local_addr, local_rkey) across ranks. */
-	std::vector<uint64_t> scratch_all_addrs(nranks, 0);
-	std::vector<uint32_t> scratch_all_rkeys(nranks, 0);
-	scratch_all_addrs[rank] = ctx->scratch_local_addr;
-	scratch_all_rkeys[rank] = ctx->scratch_lkey;
+	auto &domain = put_comm->get_resources().get_ep().get_domain();
 
-	if (put_comm->get_ag_comm().all_gather(
-		    scratch_all_addrs.data(), sizeof(uint64_t)) != 0) {
-		throw std::runtime_error("scratch allgather addrs failed");
-	}
-	if (put_comm->get_ag_comm().all_gather(
-		    scratch_all_rkeys.data(), sizeof(uint32_t)) != 0) {
-		throw std::runtime_error("scratch allgather rkeys failed");
-	}
+	/* Register the one shared scratch buffer on each used rail's domain.
+	 * Each rail produces its own lkey, and peers register on their own
+	 * rails too, so the (addr, rkey) allgather is per-rail. A logical
+	 * context bound to rail r reads its scratch keys from
+	 * rail_shared[r]. */
+	for (uint16_t r = 0; r < ctx->effective_rails; r++) {
+		struct fid_domain *dom_r = domain.get_ofi_domain(r).get();
+		if (dom_r == nullptr) {
+			throw std::runtime_error(
+				"scratch: rail " + std::to_string(r) + " domain is null");
+		}
+		auto &rs = *ctx->rail_shared[r];
 
-	ctx->scratch_remote_addrs_buf.allocate(nranks);
-	ctx->scratch_remote_rkeys_buf.allocate(nranks);
-	for (int i = 0; i < nranks; i++) {
-		ctx->scratch_remote_addrs_buf.host[i] = scratch_all_addrs[i];
-		ctx->scratch_remote_rkeys_buf.host[i] = scratch_all_rkeys[i];
+		struct iovec iov = { .iov_base = ctx->scratch_buf,
+				     .iov_len = kScratchBytes };
+		struct fi_mr_attr mr_attr = {};
+		mr_attr.mr_iov = &iov;
+		mr_attr.iov_count = 1;
+		/* Only used as source/target of RDMA WRITE on the signal
+		 * endpoints; FI_SEND / FI_RECV are not required. */
+		mr_attr.access = FI_REMOTE_WRITE | FI_WRITE;
+		mr_attr.iface = FI_HMEM_SYSTEM;
+
+		int mret = fi_mr_regattr(dom_r, &mr_attr, 0, &rs.scratch_mr);
+		if (mret != 0) {
+			throw std::runtime_error(
+				"scratch fi_mr_regattr (rail " + std::to_string(r) +
+				") failed: " + std::string(fi_strerror(-mret)));
+		}
+		rs.scratch_lkey = (uint32_t)fi_mr_key(rs.scratch_mr);
+
+		/* Allgather (local_addr, rail-r rkey) across ranks. */
+		std::vector<uint64_t> scratch_all_addrs(nranks, 0);
+		std::vector<uint32_t> scratch_all_rkeys(nranks, 0);
+		scratch_all_addrs[rank] = ctx->scratch_local_addr;
+		scratch_all_rkeys[rank] = rs.scratch_lkey;
+
+		if (put_comm->get_ag_comm().all_gather(
+			    scratch_all_addrs.data(), sizeof(uint64_t)) != 0) {
+			throw std::runtime_error("scratch allgather addrs failed");
+		}
+		if (put_comm->get_ag_comm().all_gather(
+			    scratch_all_rkeys.data(), sizeof(uint32_t)) != 0) {
+			throw std::runtime_error("scratch allgather rkeys failed");
+		}
+
+		rs.scratch_remote_addrs_buf.allocate(nranks);
+		rs.scratch_remote_rkeys_buf.allocate(nranks);
+		for (int i = 0; i < nranks; i++) {
+			rs.scratch_remote_addrs_buf.host[i] = scratch_all_addrs[i];
+			rs.scratch_remote_rkeys_buf.host[i] = scratch_all_rkeys[i];
+		}
+		rs.scratch_remote_addrs_buf.commit();
+		rs.scratch_remote_rkeys_buf.commit();
 	}
-	ctx->scratch_remote_addrs_buf.commit();
-	ctx->scratch_remote_rkeys_buf.commit();
 }
 
 /*
@@ -267,7 +281,7 @@ static void setup_scratch_buffer(nccl_ofi_gin_gdaki_context *ctx,
  * populated so each sq_size is finalized.
  */
 static void setup_putvalue_pool(nccl_ofi_gin_gdaki_context *ctx,
-				struct fid_domain *ofi_domain)
+				nccl_ofi_rdma_gin_put_comm *put_comm)
 {
 	const int nContexts = ctx->nContexts;
 
@@ -329,28 +343,44 @@ static void setup_putvalue_pool(nccl_ofi_gin_gdaki_context *ctx,
 		throw std::runtime_error("putvalue get_gpu_device_for_addr failed");
 	}
 
-	struct fi_mr_dmabuf pv_dmabuf = {};
-	pv_dmabuf.fd        = pv_fd;
-	pv_dmabuf.offset    = pv_fd_offset;
-	pv_dmabuf.len       = actual_size;
-	pv_dmabuf.base_addr = gpu_pool;
-
-	struct fi_mr_attr pv_mr_attr = {};
-	pv_mr_attr.dmabuf      = &pv_dmabuf;
-	pv_mr_attr.iov_count   = 1;
-	pv_mr_attr.access      = FI_REMOTE_WRITE | FI_WRITE | FI_SEND | FI_RECV;
-	pv_mr_attr.iface       = FI_HMEM_CUDA;
-	pv_mr_attr.device.cuda = cuda_dev;
-	pv_mr_attr.requested_key = 0;
-
-	int ret = fi_mr_regattr(ofi_domain, &pv_mr_attr, FI_MR_DMABUF, &ctx->putvalue_mr);
-	if (ret != 0) {
-		throw std::runtime_error(
-			"putvalue fi_mr_regattr (FI_MR_DMABUF, FI_HMEM_CUDA) failed: " +
-			std::string(fi_strerror(-ret)));
-	}
-	ctx->putvalue_lkey = (uint32_t)fi_mr_key(ctx->putvalue_mr);
 	ctx->putvalue_local_addr = (uint64_t)gpu_pool;
+
+	/* Register the one shared pool on each used rail's domain. The
+	 * pool's GPU VA (and hence every endpoint's slice base) is the same
+	 * across rails; only the lkey differs per rail. A logical context
+	 * bound to rail r reads its putvalue lkey from rail_shared[r]. */
+	auto &domain = put_comm->get_resources().get_ep().get_domain();
+	for (uint16_t r = 0; r < ctx->effective_rails; r++) {
+		struct fid_domain *dom_r = domain.get_ofi_domain(r).get();
+		if (dom_r == nullptr) {
+			throw std::runtime_error(
+				"putvalue: rail " + std::to_string(r) + " domain is null");
+		}
+		auto &rs = *ctx->rail_shared[r];
+
+		struct fi_mr_dmabuf pv_dmabuf = {};
+		pv_dmabuf.fd        = pv_fd;
+		pv_dmabuf.offset    = pv_fd_offset;
+		pv_dmabuf.len       = actual_size;
+		pv_dmabuf.base_addr = gpu_pool;
+
+		struct fi_mr_attr pv_mr_attr = {};
+		pv_mr_attr.dmabuf      = &pv_dmabuf;
+		pv_mr_attr.iov_count   = 1;
+		pv_mr_attr.access      = FI_REMOTE_WRITE | FI_WRITE | FI_SEND | FI_RECV;
+		pv_mr_attr.iface       = FI_HMEM_CUDA;
+		pv_mr_attr.device.cuda = cuda_dev;
+		pv_mr_attr.requested_key = 0;
+
+		int ret = fi_mr_regattr(dom_r, &pv_mr_attr, FI_MR_DMABUF, &rs.putvalue_mr);
+		if (ret != 0) {
+			throw std::runtime_error(
+				"putvalue fi_mr_regattr (rail " + std::to_string(r) +
+				", FI_MR_DMABUF, FI_HMEM_CUDA) failed: " +
+				std::string(fi_strerror(-ret)));
+		}
+		rs.putvalue_lkey = (uint32_t)fi_mr_key(rs.putvalue_mr);
+	}
 
 	/* Assign per-endpoint slice bases across every context. Each
 	 * endpoint stores its slice base on its own GPU-resident
@@ -400,21 +430,33 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle &h,
 	h.nSignals  = ctx->nSignals;
 	h.nranks = nranks;
 	h.rank = rank;
-	h.scratch_lkey         = ctx->scratch_lkey;
+
+	/* Multi-rail: bind this logical context to rail (ctx_id % num_rails)
+	 * — Policy A. The kernel reads rail_id to select the matching
+	 * per-rail mr_handle from the window; the scratch / putvalue keys
+	 * below are pulled from this rail's shared registration so they're
+	 * already rail-resolved. */
+	const uint16_t rail_id = (uint16_t)(ctx_id % ctx->num_rails);
+	const auto &rs = *ctx->rail_shared[rail_id];
+	h.rail_id = rail_id;
+	h.rail_pad = 0;
+
+	h.scratch_lkey         = rs.scratch_lkey;
 	h.scratch_pad          = 0;
 	h.scratch_local_addr   = ctx->scratch_local_addr;
-	h.scratch_remote_addrs = ctx->scratch_remote_addrs_buf.dev;
-	h.scratch_remote_rkeys = ctx->scratch_remote_rkeys_buf.dev;
+	h.scratch_remote_addrs = rs.scratch_remote_addrs_buf.dev;
+	h.scratch_remote_rkeys = rs.scratch_remote_rkeys_buf.dev;
 	/* PutValue slot pool. The pool is allocated unconditionally
 	 * (sized off every context's data.sq_size, which is always
-	 * non-zero), so we always populate these fields. The lkey and
-	 * slot_size are shared across all contexts; the per-context data
-	 * slice base lives on ctx->data[ctx_id]. sc_endpoint slice bases
-	 * live on each sc_endpoint's counter_dev_handle / signal_dev_handle,
-	 * set by gdaki_sc_endpoint::set_putvalue_slice_base in
-	 * setup_putvalue_pool. No commit here — the caller commits the whole
-	 * dev_handles[] array once after every entry is filled. */
-	h.putvalue_lkey            = ctx->putvalue_lkey;
+	 * non-zero), so we always populate these fields. The slot_size and
+	 * slice base are rail-independent (one pool, same GPU VA on every
+	 * rail); only the lkey is per-rail (from rail_shared[rail_id]).
+	 * sc_endpoint slice bases live on each sc_endpoint's
+	 * counter_dev_handle / signal_dev_handle, set by
+	 * gdaki_sc_endpoint::set_putvalue_slice_base in setup_putvalue_pool.
+	 * No commit here — the caller commits the whole dev_handles[] array
+	 * once after every entry is filled. */
+	h.putvalue_lkey            = rs.putvalue_lkey;
 	h.putvalue_slot_size       = (uint32_t)ctx->putvalue_slot_size;
 	h.data.putvalue_slice_base = ctx->data[ctx_id]->putvalue_slice_base;
 }
@@ -524,20 +566,38 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 
 	try {
 		/*
-		 * Step 1: Reuse the proxy plugin's libfabric domain.
+		 * Step 1: Reuse the proxy plugin's libfabric domains, one per
+		 * rail (EFA NIC).
 		 *
 		 * On libfabric 2.4+ the proxy plugin selects the "efa-direct"
 		 * fabric (see nccl_ofi_ofiutils_get_providers +
 		 * prov_filter_by_match against the first entry, which is
-		 * efa-direct). That domain exposes FI_EFA_GDA_OPS. Reusing it
-		 * ensures MR keys registered via extGin->regMrSym are valid on
-		 * the endpoints we open here.
+		 * efa-direct). Each rail's domain exposes FI_EFA_GDA_OPS.
+		 * Reusing them ensures MR keys registered via extGin->regMrSym
+		 * are valid on the endpoints we open here.
+		 *
+		 * Multi-rail (Policy A): logical context c is bound to rail
+		 * c % num_rails, so its data + sc endpoints open on that rail's
+		 * domain. effective_rails = min(nContexts, num_rails) is how
+		 * many rails get used (and get the shared scratch/putvalue MRs).
 		 */
-		auto &proxy_domain_ptr =
-			put_comm->get_resources().get_ep().get_domain().get_ofi_domain(0);
-		struct fid_domain *ofi_domain = proxy_domain_ptr.get();
-		if (ofi_domain == nullptr) {
-			throw std::runtime_error("proxy domain pointer is null");
+		auto &gin_ep = put_comm->get_resources().get_ep();
+		auto &domain = gin_ep.get_domain();
+		uint16_t num_rails = gin_ep.get_num_rails();
+		if (num_rails == 0) {
+			throw std::runtime_error("gin endpoint reports zero rails");
+		}
+		if (num_rails > NCCL_OFI_GDAKI_MAX_RAILS) {
+			NCCL_OFI_INFO(NCCL_NET,
+				      "gin GDAKI: capping num_rails %u -> %d (MAX_RAILS)",
+				      num_rails, NCCL_OFI_GDAKI_MAX_RAILS);
+			num_rails = NCCL_OFI_GDAKI_MAX_RAILS;
+		}
+		ctx->num_rails = num_rails;
+		ctx->effective_rails =
+			(uint16_t)std::min<int>(nContexts, num_rails);
+		for (uint16_t r = 0; r < ctx->effective_rails; r++) {
+			ctx->rail_shared[r] = std::make_unique<gdaki_rail_shared>();
 		}
 
 		auto *plugin = nccl_net_ofi_get_plugin();
@@ -545,24 +605,35 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		if (device == nullptr) {
 			throw std::runtime_error("get_device returned null");
 		}
-		struct fi_info *proxy_info = device->get_ofi_info(0);
-		if (proxy_info == nullptr) {
-			throw std::runtime_error("proxy fi_info is null");
-		}
 
-		/*
-		 * Step 2: Open FI_EFA_GDA_OPS on the reused domain. Used by
-		 * data EPs (to bind the FI_WRITE counter), data.populate(),
-		 * and the sc_endpoint loop below.
-		 */
-		struct fi_efa_ops_gda *gda_ops = nullptr;
-		int ret = fi_open_ops(&ofi_domain->fid, FI_EFA_GDA_OPS, 0,
-				      reinterpret_cast<void **>(&gda_ops), nullptr);
-		if (ret != 0 || gda_ops == nullptr) {
-			throw std::runtime_error(
-				"fi_open_ops FI_EFA_GDA_OPS on proxy domain failed "
-				"(libfabric too old, or proxy selected non-efa-direct fabric): " +
-				std::string(ret ? fi_strerror(-ret) : "no ops table"));
+		/* Per-rail GDA ops table and fi_info, indexed by rail id. Open
+		 * FI_EFA_GDA_OPS on each used rail's domain (used by data EPs to
+		 * bind the FI_WRITE counter, data.populate(), and sc EPs). */
+		struct fi_efa_ops_gda *gda_ops_rail[NCCL_OFI_GDAKI_MAX_RAILS] = {};
+		struct fi_info *proxy_info_rail[NCCL_OFI_GDAKI_MAX_RAILS] = {};
+		for (uint16_t r = 0; r < ctx->effective_rails; r++) {
+			struct fid_domain *dom_r = domain.get_ofi_domain(r).get();
+			if (dom_r == nullptr) {
+				throw std::runtime_error(
+					"rail " + std::to_string(r) + " domain is null");
+			}
+			struct fi_info *info_r = device->get_ofi_info(r);
+			if (info_r == nullptr) {
+				throw std::runtime_error(
+					"rail " + std::to_string(r) + " fi_info is null");
+			}
+			struct fi_efa_ops_gda *ops_r = nullptr;
+			int ret = fi_open_ops(&dom_r->fid, FI_EFA_GDA_OPS, 0,
+					      reinterpret_cast<void **>(&ops_r), nullptr);
+			if (ret != 0 || ops_r == nullptr) {
+				throw std::runtime_error(
+					"fi_open_ops FI_EFA_GDA_OPS on rail " +
+					std::to_string(r) + " failed "
+					"(libfabric too old, or proxy selected non-efa-direct fabric): " +
+					std::string(ret ? fi_strerror(-ret) : "no ops table"));
+			}
+			gda_ops_rail[r] = ops_r;
+			proxy_info_rail[r] = info_r;
 		}
 
 		/* Pre-size all per-ctx vectors and the contiguous dev_handles[]
@@ -592,9 +663,10 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		 * ctxs on this rank because the buffer's contents are never
 		 * read or written — 0-byte RDMA writes only tick the per-EP
 		 * FI_REMOTE_WRITE counter on the receiver, and the buffer is
-		 * just a registered destination address.
+		 * just a registered destination address. Registered on each
+		 * used rail's domain (one MR per rail).
 		 */
-		setup_scratch_buffer(ctx.get(), ofi_domain, put_comm, nranks, rank);
+		setup_scratch_buffer(ctx.get(), put_comm, nranks, rank);
 
 		/*
 		 * Per-context loop: build (data EP + sc EPs + counter/signal
@@ -605,8 +677,16 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		constexpr size_t ep_addr_len = MAX_EP_ADDR;
 		const int n_sc = std::max(config->nSignals, config->nCounters);
 		for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
+			/* Policy A: this context's endpoints open on rail
+			 * (ctx_id % num_rails)'s domain. Distinct contextIds
+			 * therefore spread across the GPU's NICs. */
+			const uint16_t rail_id = (uint16_t)(ctx_id % num_rails);
+			struct fid_domain *ofi_domain = domain.get_ofi_domain(rail_id).get();
+			struct fi_info *proxy_info = proxy_info_rail[rail_id];
+			struct fi_efa_ops_gda *gda_ops = gda_ops_rail[rail_id];
+
 			/*
-			 * Step 4: Open this ctx's data endpoint on the reused
+			 * Step 4: Open this ctx's data endpoint on its rail's
 			 * domain.
 			 */
 			ctx->data[ctx_id]->open(ofi_domain, proxy_info, gda_ops);
@@ -617,6 +697,8 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			 * Each ctx's data EP is its own libfabric EP, so each
 			 * needs its own allgather — ctx ctx_id on rank A pairs with
 			 * ctx ctx_id on rank B for cross-rank symmetric communication.
+			 * Both endpoints sit on the same rail id, so they pair on
+			 * the matching NIC.
 			 */
 			std::vector<uint8_t> all_addrs = allgather_ep_addr(
 				ctx->data[ctx_id]->base.endpoint.ep, put_comm, nranks, rank, ep_addr_len);
@@ -624,8 +706,8 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 
 			/*
 			 * Step 6: Create this ctx's signal/counter endpoints
-			 * (one per max(nSignals, nCounters)) and build the GPU
-			 * pointer arrays the kernel reads as
+			 * (one per max(nSignals, nCounters)) on the same rail and
+			 * build the GPU pointer arrays the kernel reads as
 			 * dev[ctx.contextId].counter_handles[] /
 			 * .signal_handles[].
 			 */
@@ -667,7 +749,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		 * commit their counter/signal dev handles inline; the data
 		 * endpoint's slice base is stashed for populate_dev_handle).
 		 */
-		setup_putvalue_pool(ctx.get(), ofi_domain);
+		setup_putvalue_pool(ctx.get(), put_comm);
 
 		/*
 		 * Step 8: Fill every context's slot in dev_handles[]. Done in
@@ -703,9 +785,11 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 
 		NCCL_OFI_INFO(NCCL_NET,
 			      "gin GDAKI: createContext done (nranks=%d rank=%d "
-			      "nSignals=%d nCounters=%d nContexts=%d)",
+			      "nSignals=%d nCounters=%d nContexts=%d num_rails=%u "
+			      "effective_rails=%u)",
 			      nranks, rank,
-			      config->nSignals, config->nCounters, nContexts);
+			      config->nSignals, config->nCounters, nContexts,
+			      ctx->num_rails, ctx->effective_rails);
 
 		*ginCtx = ctx.release();
 		*devHandle = dev_handle_out;
@@ -795,63 +879,101 @@ static ncclResult_t nccl_ofi_gin_gdaki_regMrSym(void *collComm, void *data, size
 
 	auto *put_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
 	int nranks = put_comm->get_nranks();
+	auto &gin_ep = put_comm->get_resources().get_ep();
+	auto &domain = gin_ep.get_domain();
+	uint16_t num_rails = gin_ep.get_num_rails();
+	if (num_rails > NCCL_OFI_GDAKI_MAX_RAILS) {
+		num_rails = NCCL_OFI_GDAKI_MAX_RAILS;
+	}
 
-	/* Step 2: reach through the plugin mhandle to the underlying fid_mr. */
+	/* Step 2: reach through the plugin mhandle. The proxy regMrSym has
+	 * registered this window's memory on every rail's domain, so
+	 * sym->local_handle->get_mr(r) is the fid_mr on rail r and
+	 * sym->remote_mr[i].mr_key[r] is peer i's rkey on rail r. */
 	auto *sym = static_cast<nccl_ofi_rdma_gin_symm_mr_handle *>(*mhandle);
-	struct fid_mr *mr = sym->local_handle->get_mr(0);
 
-	/* Step 3: open GDA ops on the shared domain and get the lkey.
-	 * fi_open_ops is cheap (returns a static ops table); no need to
-	 * cache it per-context. */
-	struct fid_domain *shared_domain =
-		put_comm->get_resources().get_ep().get_domain().get_ofi_domain(0).get();
-	struct fi_efa_ops_gda *gda_ops = nullptr;
-	int ret = fi_open_ops(&shared_domain->fid, FI_EFA_GDA_OPS, 0,
-			      reinterpret_cast<void **>(&gda_ops), nullptr);
-	if (ret != 0 || gda_ops == nullptr) {
-		NCCL_OFI_WARN("gin GDAKI: fi_open_ops FI_EFA_GDA_OPS failed: %s",
-			      ret ? fi_strerror(-ret) : "no ops table");
+	/* Step 3: allocate the window + its per-rail mr_handles as ONE
+	 * contiguous block.
+	 *
+	 * The device dereferences this handle directly from the kernel
+	 * (the returned pointer reaches the GPU as the ncclGinWindow_t
+	 * argument and is read via UVA). A single self-contained allocation
+	 * is therefore required — if per_rail[r] pointed at separate
+	 * calloc'd blocks, the GPU could read the pointer value but not the
+	 * pointed-to handle. So we lay out:
+	 *
+	 *   [ mr_window ][ mr_handle+peers (rail 0) ][ mr_handle+peers (rail 1) ] ...
+	 *
+	 * and point per_rail[r] INTO this same block. Every field the
+	 * kernel touches lives in one contiguous host allocation, exactly
+	 * like the single-handle layout used before multi-rail. */
+	const size_t handle_size = sizeof(nccl_ofi_gin_gdaki_mr_handle) +
+				   (size_t)nranks * sizeof(nccl_ofi_gin_gdaki_mr_peer);
+	/* mr_handle contains a uint64_t, so 8-byte align each sub-handle.
+	 * sizeof(mr_window) and handle_size are already multiples of 8. */
+	const size_t window_size = sizeof(nccl_ofi_gin_gdaki_mr_window) +
+				   (size_t)num_rails * handle_size;
+
+	auto *block = static_cast<uint8_t *>(calloc(1, window_size));
+	if (block == nullptr) {
+		NCCL_OFI_WARN("gin GDAKI: calloc for mr_window block failed");
 		return ncclSystemError;
 	}
+	auto *window = reinterpret_cast<nccl_ofi_gin_gdaki_mr_window *>(block);
 
-	uint32_t lkey = (uint32_t)gda_ops->get_mr_lkey(mr);
+	for (uint16_t r = 0; r < num_rails; r++) {
+		/* Open GDA ops on rail r's domain and query rail r's lkey.
+		 * fi_open_ops is cheap (returns a static ops table). */
+		struct fid_domain *dom_r = domain.get_ofi_domain(r).get();
+		if (dom_r == nullptr) {
+			NCCL_OFI_WARN("gin GDAKI: regMrSym rail %u domain is null", r);
+			free(block);
+			return ncclSystemError;
+		}
+		struct fi_efa_ops_gda *gda_ops = nullptr;
+		int ret = fi_open_ops(&dom_r->fid, FI_EFA_GDA_OPS, 0,
+				      reinterpret_cast<void **>(&gda_ops), nullptr);
+		if (ret != 0 || gda_ops == nullptr) {
+			NCCL_OFI_WARN("gin GDAKI: fi_open_ops FI_EFA_GDA_OPS on rail %u failed: %s",
+				      r, ret ? fi_strerror(-ret) : "no ops table");
+			free(block);
+			return ncclSystemError;
+		}
 
-	/* Step 4/5: allocate and populate the device-visible handle.
-	 * Layout: base struct + flex peers[nranks]. */
-	size_t handle_size = sizeof(nccl_ofi_gin_gdaki_mr_handle) +
-			     (size_t)nranks * sizeof(nccl_ofi_gin_gdaki_mr_peer);
-	auto *gdaki_handle = static_cast<nccl_ofi_gin_gdaki_mr_handle *>(
-		calloc(1, handle_size));
-	if (gdaki_handle == nullptr) {
-		NCCL_OFI_WARN("gin GDAKI: calloc for gdaki_mr_handle failed");
-		return ncclSystemError;
-	}
+		struct fid_mr *mr_r = sym->local_handle->get_mr(r);
+		uint32_t lkey_r = (uint32_t)gda_ops->get_mr_lkey(mr_r);
 
-	gdaki_handle->lkey = lkey;
-	gdaki_handle->nranks = nranks;
-	gdaki_handle->local_addr = (uint64_t)data;
-	for (int i = 0; i < nranks; i++) {
-		/* remote_mr[i].address is the peer's base VA, allgathered by
-		 * the shared regMrSym. remote_mr[i].mr_key[0] is the peer's
-		 * rkey on rail 0. */
-		gdaki_handle->peers[i].remote_addr = (uint64_t)sym->remote_mr[i].address;
-		gdaki_handle->peers[i].rkey        = (uint32_t)sym->remote_mr[i].mr_key[0];
+		/* per_rail[r] points INTO the same block (after the window
+		 * header, at the r-th handle slot). */
+		auto *gdaki_handle = reinterpret_cast<nccl_ofi_gin_gdaki_mr_handle *>(
+			block + sizeof(nccl_ofi_gin_gdaki_mr_window) +
+			(size_t)r * handle_size);
+		gdaki_handle->lkey = lkey_r;
+		gdaki_handle->nranks = nranks;
+		gdaki_handle->local_addr = (uint64_t)data;
+		for (int i = 0; i < nranks; i++) {
+			gdaki_handle->peers[i].remote_addr =
+				(uint64_t)sym->remote_mr[i].address;
+			gdaki_handle->peers[i].rkey =
+				(uint32_t)sym->remote_mr[i].mr_key[r];
+		}
+		window->per_rail[r] = gdaki_handle;
 	}
 
 	/* Stash on the mhandle so deregMrSym can free it. The mhandle and
-	 * the gdaki_handle share a lifetime by construction. */
-	sym->gin_device_handle = gdaki_handle;
+	 * the window share a lifetime by construction. */
+	sym->gin_device_handle = window;
 
-	*ginHandle = gdaki_handle;
+	*ginHandle = window;
 	return ncclSuccess;
 }
 
 static ncclResult_t nccl_ofi_gin_gdaki_deregMrSym(void *collComm, void *mhandle)
 {
-	/* Free the device-visible handle first. The mhandle's
-	 * gin_device_handle points at plain heap memory owned by the
-	 * GDAKI regMrSym above; the underlying fid_mr is torn down by
-	 * the shared deregMrSym call that follows. */
+	/* Free the contiguous window block (which embeds every per-rail
+	 * mr_handle). The mhandle's gin_device_handle points at plain heap
+	 * memory owned by the GDAKI regMrSym above; the underlying fid_mrs
+	 * are torn down by the shared deregMrSym call that follows. */
 	auto *sym = static_cast<nccl_ofi_rdma_gin_symm_mr_handle *>(mhandle);
 	free(sym->gin_device_handle);
 	sym->gin_device_handle = nullptr;
