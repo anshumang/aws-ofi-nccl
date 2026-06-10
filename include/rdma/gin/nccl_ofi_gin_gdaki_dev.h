@@ -84,6 +84,18 @@ struct nccl_ofi_gin_gdaki_mr_handle {
 	struct nccl_ofi_gin_gdaki_mr_peer peers[];
 };
 
+/* Maximum number of rails (EFA NICs) per GPU the GDAKI path supports.
+ * p5en has 2 NICs/GPU; p6-b200 has 1. Used to size per-rail arrays
+ * during createContext / regMrSym. */
+#define NCCL_OFI_GDAKI_MAX_RAILS 2
+
+/* regMrSym registers a window's memory once per rail (each rail has its
+ * own libfabric domain, hence its own lkey and the peer's per-rail rkey)
+ * and returns, as ginHandle, an array of per-rail mr_handle pointers:
+ * (struct nccl_ofi_gin_gdaki_mr_handle *)[num_rails], allocated in host
+ * memory. The kernel selects the handle for its logical context's rail
+ * by indexing that array with dev->rail_id. */
+
 /**
  * Work queue descriptor, layout-compatible with efa_cuda_wq from efa-dp-direct.
  *
@@ -283,6 +295,16 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 
 	/* Rank of the local process within the context. */
 	int32_t rank;
+
+	/* Multi-rail: the rail (EFA NIC) this logical context is bound to.
+	 * The plugin opens this context's endpoints on rail rail_id's
+	 * domain and bakes that rail's scratch / putvalue lkeys (and the
+	 * peers' per-rail rkeys) into this handle. The kernel uses rail_id
+	 * only to index the per-rail mr_handle array regMrSym returns as
+	 * the window; every endpoint / scratch / putvalue field here is
+	 * already rail-resolved. rail_id = contextId % num_rails. Mirror
+	 * of the NCCL-side field. */
+	uint32_t rail_id;
 
 	/* Signal-only scratch buffer support.
 	 *
