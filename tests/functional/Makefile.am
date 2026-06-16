@@ -61,6 +61,48 @@ if ENABLE_GDAKI
 if HAVE_NVCC
 SUFFIXES = .cu
 
+# efa-dp-direct provides the EFA device-side (CUDA) datapath headers used by
+# the GDAKI GPU functional tests. It is declared in .gitmodules with
+# 'update = none', so a plain `git submodule update --init [--recursive]'
+# (what non-GDAKI builders run) deliberately SKIPS it -- they are never forced
+# to take on this dependency. We initialize it on demand here -- and ONLY
+# here, gated by ENABLE_FUNC_TESTS + ENABLE_GDAKI + HAVE_NVCC. The pinned
+# commit is the gitlink recorded in the superproject; bump it the usual
+# submodule way (cd in, checkout, commit the new gitlink).
+#
+# NOTE: 'update = none' is only overridden by an EXPLICIT path init that
+# passes --checkout (verified: `--init -- <path>' alone does NOT override it).
+EFA_DP_DIRECT_PATH = 3rd-party/efa-dp-direct
+EFA_DP_DIRECT_SRC = $(abs_top_srcdir)/$(EFA_DP_DIRECT_PATH)
+EFA_DP_DIRECT_STAMP = efa-dp-direct-submodule.stamp
+
+$(EFA_DP_DIRECT_STAMP):
+	@set -e; \
+	if test ! -f "$(EFA_DP_DIRECT_SRC)/CUDA/src/efa_cuda_dp.cuh"; then \
+		if git -C "$(abs_top_srcdir)" rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+			echo "  SUBMODULE efa-dp-direct (GDAKI GPU tests)"; \
+			cd "$(abs_top_srcdir)" && \
+				git submodule update --init --checkout -- $(EFA_DP_DIRECT_PATH); \
+		else \
+			echo "ERROR: $(EFA_DP_DIRECT_PATH) is missing and this is not a git" >&2; \
+			echo "       checkout, so the efa-dp-direct submodule cannot be" >&2; \
+			echo "       initialized. The GDAKI GPU functional tests require it." >&2; \
+			exit 1; \
+		fi; \
+	fi; \
+	touch "$@"
+
+# BUILT_SOURCES runs before any compilation in this directory. This
+# assignment only takes effect inside the ENABLE_GDAKI + HAVE_NVCC block
+# (we are already inside it here), so the submodule is initialized only for
+# func-test + GDAKI + nvcc builds.
+BUILT_SOURCES = $(EFA_DP_DIRECT_STAMP)
+
+# Only the local stamp is a build artifact; the submodule itself is managed
+# by git in the source tree, so clean must not remove it.
+clean-local:
+	-rm -f $(EFA_DP_DIRECT_STAMP)
+
 gin_put_gdaki_gpu_SOURCES = $(base_sources) gin_put_gdaki_gpu.cu
 gin_put_gdaki_gpu_LDADD = $(LDADD) -lcuda
 
@@ -76,7 +118,7 @@ gin_signal_gdaki_gpu_LDADD = $(LDADD) -lcuda
 		-I$(top_srcdir)/include \
 		-I$(top_srcdir)/3rd-party \
 		-I$(top_srcdir)/3rd-party/nccl/$(DEVICE_INTERFACE)/include \
-		-I$(top_srcdir)/3rd-party/efa-dp-direct/CUDA/src \
+		-I$(EFA_DP_DIRECT_SRC)/CUDA/src \
 		$(MPI_CPPFLAGS) $(CUDA_CPPFLAGS) \
 		-c -o $@ $<
 endif # HAVE_NVCC
