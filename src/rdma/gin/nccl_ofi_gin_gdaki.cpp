@@ -39,6 +39,22 @@
 #include "nccl_ofi_param.h"
 
 /*
+ * Debug gate for the asymmetric signal/counter exchange. When
+ * NCCL_OFI_GDAKI_SIG_DEBUG is set to a non-zero value, createContext logs
+ * the per-peer counts each rank received and the resolved signal-target
+ * (ahn, qpn, qkey) tuples, so a cross-rank exchange mismatch is visible.
+ * Evaluated once.
+ */
+static bool sig_debug_enabled()
+{
+	static const bool enabled = []() {
+		const char *v = getenv("NCCL_OFI_GDAKI_SIG_DEBUG");
+		return v != nullptr && v[0] != '\0' && v[0] != '0';
+	}();
+	return enabled;
+}
+
+/*
  * GDAKI contexts tracked by collComm so we can clean them up at
  * closeColl time. NCCL's GIN call sequence is supposed to be
  *   createContext -> destroyContext -> closeColl
@@ -260,6 +276,21 @@ static void exchange_signal_counter_counts(nccl_ofi_gin_gdaki_context *ctx,
 		ctx->peer_nSignals_buf.host[p] = (int32_t)ctx->peer_nSignals_host[p];
 	}
 	ctx->peer_nSignals_buf.commit();
+
+	if (sig_debug_enabled()) {
+		NCCL_OFI_INFO(NCCL_NET,
+			      "gin GDAKI SIG_DEBUG: rank %d local(nSignals=%d nCounters=%d) "
+			      "global_n_sc=%d global_nSignals=%d",
+			      rank, ctx->nSignals, ctx->nCounters,
+			      ctx->global_n_sc, ctx->global_nSignals);
+		for (int p = 0; p < nranks; p++) {
+			NCCL_OFI_INFO(NCCL_NET,
+				      "gin GDAKI SIG_DEBUG: rank %d <- peer %d: "
+				      "nSignals=%d n_sc=%d",
+				      rank, p, ctx->peer_nSignals_host[p],
+				      ctx->peer_n_sc[p]);
+		}
+	}
 }
 
 /*
@@ -487,6 +518,12 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle &h,
 	h.data.sig_address_handles = ctx->data[ctx_id]->sig_addr.ahs.dev;
 	h.data.sig_remote_qpns     = ctx->data[ctx_id]->sig_addr.qpns.dev;
 	h.data.sig_qkey            = ctx->data[ctx_id]->sig_addr.qkeys.dev;
+	/* Counter-target ("quiet sink") addressing for the data endpoint as a
+	 * poster. [nranks] peer-data-EP table; NULL when this rank has no
+	 * counters. Built by data[ctx_id]->build_counter_addressing. */
+	h.data.cnt_address_handles = ctx->data[ctx_id]->cnt_addr.ahs.dev;
+	h.data.cnt_remote_qpns     = ctx->data[ctx_id]->cnt_addr.qpns.dev;
+	h.data.cnt_qkey            = ctx->data[ctx_id]->cnt_addr.qkeys.dev;
 	h.counter_handles = (ctx->nCounters > 0) ? ctx->d_counter_handles[ctx_id]->dev : nullptr;
 	h.signal_handles  = (ctx->nSignals  > 0) ? ctx->d_signal_handles[ctx_id]->dev  : nullptr;
 	h.nCounters = ctx->nCounters;
@@ -722,11 +759,14 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			std::vector<uint8_t> all_addrs = allgather_ep_addrs_batched(
 				eps, put_comm, nranks, rank, ep_addr_len);
 
+			/* Peer DATA endpoint addresses (slot 0): used both for the
+			 * data EP's own diagonal and as the counter-target ("quiet
+			 * sink") for every poster's counter-only writes. */
+			std::vector<uint8_t> data_peer_addrs =
+				extract_ep_addr_slot(all_addrs, nranks, total_slots, 0, ep_addr_len);
+
 			/* Data EP diagonal addressing (slot 0). */
-			ctx->data[ctx_id]->populate(
-				gda_ops,
-				extract_ep_addr_slot(all_addrs, nranks, total_slots, 0, ep_addr_len),
-				ep_addr_len, nranks);
+			ctx->data[ctx_id]->populate(gda_ops, data_peer_addrs, ep_addr_len, nranks);
 
 			/* Each local sc EP's diagonal addressing (slot 1+i = peer's
 			 * sc-EP[i]). */
@@ -784,6 +824,62 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 				for (int i = 0; i < local_n_sc; i++) {
 					ctx->sc_endpoints[ctx_id][i]->build_signal_addressing(
 						gda_ops, sig_peer_addrs, ep_addr_len, global_nSignals, nranks);
+				}
+
+				if (sig_debug_enabled()) {
+					/* Dump the resolved signal-target table for the
+					 * data EP poster (representative; all posters
+					 * resolve the same peer addresses). A slot peer p
+					 * does not expose (s >= peer_nSignals[p]) shows the
+					 * zeroed/absent tuple, which a correct caller never
+					 * addresses. */
+					const gdaki_signal_addressing &sa = ctx->data[ctx_id]->sig_addr;
+					for (int s = 0; s < global_nSignals; s++) {
+						for (int peer = 0; peer < nranks; peer++) {
+							const size_t idx = (size_t)s * (size_t)nranks + (size_t)peer;
+							const bool absent = (s >= ctx->peer_nSignals_host[peer]);
+							NCCL_OFI_INFO(NCCL_NET,
+								"gin GDAKI SIG_DEBUG: ctx %d rank %d -> "
+								"signalId %d peer %d: ahn=%u qpn=%u qkey=%u%s",
+								ctx_id, rank, s, peer,
+								sa.ahs.host[idx], sa.qpns.host[idx],
+								sa.qkeys.host[idx],
+								absent ? " (absent)" : "");
+						}
+					}
+				}
+			}
+
+			/*
+			 * Counter-target ("quiet sink") addressing. A counter-only
+			 * write (hasCounter && !hasSignal) posts from this rank's
+			 * counter endpoint (so the correct local FI_WRITE counter
+			 * ticks) but must land on the peer's DATA endpoint -- which
+			 * has no FI_REMOTE_WRITE bound -- so it does NOT spuriously
+			 * fire a signal on the receiver. Build the [nranks]
+			 * peer-data-EP table on every poster (data EP + all local
+			 * sc EPs) when this rank has counters to post.
+			 */
+			if (config->nCounters > 0) {
+				ctx->data[ctx_id]->build_counter_addressing(
+					gda_ops, data_peer_addrs, ep_addr_len, nranks);
+				for (int i = 0; i < local_n_sc; i++) {
+					ctx->sc_endpoints[ctx_id][i]->build_counter_addressing(
+						gda_ops, data_peer_addrs, ep_addr_len, nranks);
+				}
+
+				if (sig_debug_enabled()) {
+					/* Dump the resolved counter-target (peer data EP)
+					 * table for the data EP poster (representative). */
+					const gdaki_peer_addressing &ca = ctx->data[ctx_id]->cnt_addr;
+					for (int peer = 0; peer < nranks; peer++) {
+						NCCL_OFI_INFO(NCCL_NET,
+							"gin GDAKI SIG_DEBUG: ctx %d rank %d -> "
+							"counter-target peer %d (data EP): ahn=%u qpn=%u qkey=%u",
+							ctx_id, rank, peer,
+							ca.ahs.host[peer], ca.qpns.host[peer],
+							ca.qkeys.host[peer]);
+					}
 				}
 			}
 
