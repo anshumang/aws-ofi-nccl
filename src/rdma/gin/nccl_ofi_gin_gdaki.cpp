@@ -39,6 +39,22 @@
 #include "nccl_ofi_param.h"
 
 /*
+ * Debug gate for the asymmetric signal/counter exchange. When
+ * NCCL_OFI_GDAKI_SIG_DEBUG is set to a non-zero value, createContext logs
+ * the per-peer counts each rank received and the resolved signal-target
+ * (ahn, qpn, qkey) tuples, so a cross-rank exchange mismatch is visible.
+ * Evaluated once.
+ */
+static bool sig_debug_enabled()
+{
+	static const bool enabled = []() {
+		const char *v = getenv("NCCL_OFI_GDAKI_SIG_DEBUG");
+		return v != nullptr && v[0] != '\0' && v[0] != '0';
+	}();
+	return enabled;
+}
+
+/*
  * GDAKI contexts tracked by collComm so we can clean them up at
  * closeColl time. NCCL's GIN call sequence is supposed to be
  *   createContext -> destroyContext -> closeColl
@@ -260,6 +276,21 @@ static void exchange_signal_counter_counts(nccl_ofi_gin_gdaki_context *ctx,
 		ctx->peer_nSignals_buf.host[p] = (int32_t)ctx->peer_nSignals_host[p];
 	}
 	ctx->peer_nSignals_buf.commit();
+
+	if (sig_debug_enabled()) {
+		NCCL_OFI_INFO(NCCL_NET,
+			      "gin GDAKI SIG_DEBUG: rank %d local(nSignals=%d nCounters=%d) "
+			      "global_n_sc=%d global_nSignals=%d",
+			      rank, ctx->nSignals, ctx->nCounters,
+			      ctx->global_n_sc, ctx->global_nSignals);
+		for (int p = 0; p < nranks; p++) {
+			NCCL_OFI_INFO(NCCL_NET,
+				      "gin GDAKI SIG_DEBUG: rank %d <- peer %d: "
+				      "nSignals=%d n_sc=%d",
+				      rank, p, ctx->peer_nSignals_host[p],
+				      ctx->peer_n_sc[p]);
+		}
+	}
 }
 
 /*
@@ -784,6 +815,29 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 				for (int i = 0; i < local_n_sc; i++) {
 					ctx->sc_endpoints[ctx_id][i]->build_signal_addressing(
 						gda_ops, sig_peer_addrs, ep_addr_len, global_nSignals, nranks);
+				}
+
+				if (sig_debug_enabled()) {
+					/* Dump the resolved signal-target table for the
+					 * data EP poster (representative; all posters
+					 * resolve the same peer addresses). A slot peer p
+					 * does not expose (s >= peer_nSignals[p]) shows the
+					 * zeroed/absent tuple, which a correct caller never
+					 * addresses. */
+					const gdaki_signal_addressing &sa = ctx->data[ctx_id]->sig_addr;
+					for (int s = 0; s < global_nSignals; s++) {
+						for (int peer = 0; peer < nranks; peer++) {
+							const size_t idx = (size_t)s * (size_t)nranks + (size_t)peer;
+							const bool absent = (s >= ctx->peer_nSignals_host[peer]);
+							NCCL_OFI_INFO(NCCL_NET,
+								"gin GDAKI SIG_DEBUG: ctx %d rank %d -> "
+								"signalId %d peer %d: ahn=%u qpn=%u qkey=%u%s",
+								ctx_id, rank, s, peer,
+								sa.ahs.host[idx], sa.qpns.host[idx],
+								sa.qkeys.host[idx],
+								absent ? " (absent)" : "");
+						}
+					}
 				}
 			}
 
