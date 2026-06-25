@@ -217,6 +217,38 @@ struct nccl_ofi_gin_gdaki_dev_endpoint_handle {
 	 * Zero on endpoints that don't host PutValue traffic, but every
 	 * endpoint participating in the slot pool gets a unique non-zero base. */
 	uint64_t putvalue_slice_base;
+
+	/* Signal-target addressing for this (poster) endpoint.
+	 *
+	 * Three GPU-resident arrays that let THIS endpoint post a
+	 * signalling RDMA write addressed to peer P's signal endpoint
+	 * number `signalId` — i.e. the write ticks the FI_REMOTE_WRITE
+	 * counter of the TARGET's sc endpoint `signalId`, not the
+	 * same-index endpoint as the local poster. This is what makes the
+	 * GIN signalId a property of the target (per the GIN contract),
+	 * decoupled from which local endpoint posts the write.
+	 *
+	 * Indexed signalId-major:
+	 *     idx = signalId * dev_handle->nranks + peer
+	 * with signalId in [0, dev_handle->nSignals) and peer in
+	 * [0, dev_handle->nranks). The row count (nSignals) and stride
+	 * (nranks) live on the top-level dev_handle; NCCL and the plugin
+	 * MUST agree on this signalId-major convention (the createContext
+	 * writer and the device-side reader are compiled in separate
+	 * repos — a layout disagreement is a silent wrong-tuple read).
+	 *
+	 * Resolved through this endpoint's OWN AV against peer P's sc
+	 * endpoint `signalId` address, for every (signalId, peer). Built
+	 * for the data endpoint and every sc endpoint, because any of them
+	 * may post a signal-bearing Put/PutValue (a signal-only put needs
+	 * just a local FI_WRITE counter, which both have). NULL when
+	 * nSignals == 0.
+	 *
+	 * Layout is shared with the NCCL mirror in
+	 * nccl_device/gin/efa_gda/gin_efa_gda_dev.h — keep them in sync. */
+	uint16_t *sig_address_handles;   /* [nSignals * nranks] */
+	uint16_t *sig_remote_qpns;       /* [nSignals * nranks] */
+	uint32_t *sig_qkey;              /* [nSignals * nranks] */
 };
 
 /**
@@ -277,6 +309,14 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 
 	/* Number of signal_handles entries. 0 means signal_handles is NULL. */
 	int32_t nSignals;
+
+	/* Per-peer signal count, [nranks] in GPU memory. peer_nSignals[p] is
+	 * peer p's local nSignals — the number of signal endpoints peer p
+	 * exposes as a target, hence the exclusive upper bound on signalId a
+	 * poster may legally direct at peer p. The device uses it to bound /
+	 * validate the target signalId per peer without assuming a uniform
+	 * count across ranks. NULL when no rank requested any signals. */
+	int32_t *peer_nSignals;
 
 	/* Number of ranks participating in this context. */
 	int32_t nranks;
