@@ -189,6 +189,27 @@ void gdaki_gpu_cq::build(const struct fi_efa_cq_attr &cq_attr)
 	buf.commit();
 }
 
+/*
+ * Sentinel for "this peer has no endpoint at this slot". A rank that did
+ * not create an endpoint for a given (collective) allgather round leaves
+ * its slot zero-filled; ranks are NOT required to request the same number
+ * of signal/counter endpoints, so some (slot, peer) pairs have no remote
+ * endpoint. A real EFA address (FI_ADDR_EFA: AH + QPN + QKEY-derived bytes)
+ * is never all-zero, so an all-zero slot unambiguously means "absent" and
+ * is skipped during addressing — the corresponding table entry stays 0 and
+ * is never used by a correct caller (the kernel bounds each post by the
+ * target's advertised count).
+ */
+static bool gdaki_ep_addr_is_absent(const uint8_t *addr, size_t len)
+{
+	for (size_t i = 0; i < len; i++) {
+		if (addr[i] != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void gdaki_peer_addressing::populate(gdaki_fi_endpoint &endpoint,
 				     const std::vector<uint8_t> &peer_addrs,
 				     size_t ep_addr_len, int nranks,
@@ -199,10 +220,17 @@ void gdaki_peer_addressing::populate(gdaki_fi_endpoint &endpoint,
 	qkeys.allocate(nranks);
 
 	for (int i = 0; i < nranks; i++) {
+		const uint8_t *addr = peer_addrs.data() + (size_t)i * ep_addr_len;
+
+		/* Skip peers that have no endpoint at this index (asymmetric
+		 * counts). The zeroed table entry is never addressed by a
+		 * correct caller. */
+		if (gdaki_ep_addr_is_absent(addr, ep_addr_len)) {
+			continue;
+		}
+
 		fi_addr_t fi_addr;
-		int ret = fi_av_insert(endpoint.av,
-				       peer_addrs.data() + i * ep_addr_len,
-				       1, &fi_addr, 0, nullptr);
+		int ret = fi_av_insert(endpoint.av, addr, 1, &fi_addr, 0, nullptr);
 		if (ret != 1) {
 			throw std::runtime_error(
 				"fi_av_insert failed for rank " +
@@ -222,6 +250,67 @@ void gdaki_peer_addressing::populate(gdaki_fi_endpoint &endpoint,
 		ahs.host[i] = ahn;
 		qpns.host[i] = remote_qpn;
 		qkeys.host[i] = remote_qkey;
+	}
+
+	ahs.commit();
+	qpns.commit();
+	qkeys.commit();
+}
+
+void gdaki_signal_addressing::populate(gdaki_fi_endpoint &endpoint,
+				       const std::vector<uint8_t> &sig_peer_addrs,
+				       size_t ep_addr_len, int nSignals, int nranks,
+				       struct fi_efa_ops_gda *gda_ops)
+{
+	if (nSignals <= 0 || nranks <= 0) {
+		return;
+	}
+
+	const size_t n = (size_t)nSignals * (size_t)nranks;
+	ahs.allocate(n);
+	qpns.allocate(n);
+	qkeys.allocate(n);
+
+	/* signalId-major: idx = signalId * nranks + peer. The input
+	 * sig_peer_addrs is laid out identically, so we walk it linearly.
+	 * nSignals here is the GLOBAL row count (max over peers of their
+	 * signal count). A (signalId, peer) slot is absent when peer has
+	 * fewer than signalId+1 signal endpoints; its address is zero-filled
+	 * and skipped, leaving the table entry 0 (never addressed: the kernel
+	 * bounds each post by the target peer's advertised signal count). */
+	for (int s = 0; s < nSignals; s++) {
+		for (int peer = 0; peer < nranks; peer++) {
+			const size_t idx = (size_t)s * (size_t)nranks + (size_t)peer;
+			const uint8_t *addr = sig_peer_addrs.data() + idx * ep_addr_len;
+
+			if (gdaki_ep_addr_is_absent(addr, ep_addr_len)) {
+				continue;
+			}
+
+			fi_addr_t fi_addr;
+			int ret = fi_av_insert(endpoint.av, addr, 1, &fi_addr, 0, nullptr);
+			if (ret != 1) {
+				throw std::runtime_error(
+					"sig fi_av_insert failed (signalId " +
+					std::to_string(s) + ", rank " +
+					std::to_string(peer) + ")");
+			}
+
+			uint16_t ahn = 0, remote_qpn = 0;
+			uint32_t remote_qkey = 0;
+			ret = gda_ops->query_addr(endpoint.ep, fi_addr, &ahn,
+						  &remote_qpn, &remote_qkey);
+			if (ret != 0) {
+				throw std::runtime_error(
+					"sig query_addr failed (signalId " +
+					std::to_string(s) + ", rank " +
+					std::to_string(peer) + ")");
+			}
+
+			ahs.host[idx] = ahn;
+			qpns.host[idx] = remote_qpn;
+			qkeys.host[idx] = remote_qkey;
+		}
 	}
 
 	ahs.commit();
@@ -299,6 +388,34 @@ void gdaki_data_endpoint::populate(struct fi_efa_ops_gda *gda_ops,
 	base.populate(gda_ops, peer_addrs, ep_addr_len, nranks);
 }
 
+void gdaki_data_endpoint::build_signal_addressing(
+	struct fi_efa_ops_gda *gda_ops,
+	const std::vector<uint8_t> &sig_peer_addrs,
+	size_t ep_addr_len, int nSignals, int nranks)
+{
+	/* Resolve the [nSignals*nranks] signal-target table through this
+	 * (data) endpoint's own AV. The data endpoint exposes it through
+	 * the top-level dev_handle.data.sig_* fields (see
+	 * populate_dev_handle); no per-handle re-commit here because the
+	 * data endpoint is committed as part of the whole dev_handles[]
+	 * array at the end of createContext. */
+	sig_addr.populate(base.endpoint, sig_peer_addrs, ep_addr_len,
+			  nSignals, nranks, gda_ops);
+}
+
+void gdaki_data_endpoint::build_counter_addressing(
+	struct fi_efa_ops_gda *gda_ops,
+	const std::vector<uint8_t> &data_peer_addrs,
+	size_t ep_addr_len, int nranks)
+{
+	/* Resolve the [nranks] counter-target table (peer data EPs) through
+	 * this (data) endpoint's own AV. Exposed via the top-level
+	 * dev_handle.data.cnt_* fields in populate_dev_handle; committed with
+	 * the whole dev_handles[] array, so no per-handle re-commit here. */
+	cnt_addr.populate(base.endpoint, data_peer_addrs, ep_addr_len,
+			  nranks, gda_ops);
+}
+
 void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
 			     struct fi_efa_ops_gda *gda_ops)
 {
@@ -364,6 +481,58 @@ void gdaki_sc_endpoint::populate(struct fi_efa_ops_gda *gda_ops,
 	fill_common(signal_dev_handle.host[0]);
 	signal_dev_handle.host[0].cntr_value = remote_write_cntr.gpu_ptr();
 	signal_dev_handle.host[0].base.local_cntr_value = write_cntr.gpu_ptr();
+	signal_dev_handle.commit();
+}
+
+void gdaki_sc_endpoint::build_signal_addressing(
+	struct fi_efa_ops_gda *gda_ops,
+	const std::vector<uint8_t> &sig_peer_addrs,
+	size_t ep_addr_len, int nSignals, int nranks)
+{
+	/* Resolve the [nSignals*nranks] signal-target table through this
+	 * sc endpoint's own AV. */
+	sig_addr.populate(base.endpoint, sig_peer_addrs, ep_addr_len,
+			  nSignals, nranks, gda_ops);
+
+	if (nSignals <= 0) {
+		return;
+	}
+
+	/* Publish the table's GPU pointers into both dev handles (they
+	 * alias the same QP / addressing; either may be selected by the
+	 * kernel to post a signal-bearing Put/PutValue) and re-commit,
+	 * since populate() already uploaded their initial host state. */
+	auto set_sig = [&](nccl_ofi_gin_gdaki_dev_counter_handle &h) {
+		h.base.sig_address_handles = sig_addr.ahs.dev;
+		h.base.sig_remote_qpns     = sig_addr.qpns.dev;
+		h.base.sig_qkey            = sig_addr.qkeys.dev;
+	};
+	set_sig(counter_dev_handle.host[0]);
+	set_sig(signal_dev_handle.host[0]);
+	counter_dev_handle.commit();
+	signal_dev_handle.commit();
+}
+
+void gdaki_sc_endpoint::build_counter_addressing(
+	struct fi_efa_ops_gda *gda_ops,
+	const std::vector<uint8_t> &data_peer_addrs,
+	size_t ep_addr_len, int nranks)
+{
+	/* Resolve the [nranks] counter-target table (peer data EPs) through
+	 * this sc endpoint's own AV. */
+	cnt_addr.populate(base.endpoint, data_peer_addrs, ep_addr_len,
+			  nranks, gda_ops);
+
+	/* Publish into both dev handles (the counter-only path may post from
+	 * either, selected by counterId) and re-commit. */
+	auto set_cnt = [&](nccl_ofi_gin_gdaki_dev_counter_handle &h) {
+		h.base.cnt_address_handles = cnt_addr.ahs.dev;
+		h.base.cnt_remote_qpns     = cnt_addr.qpns.dev;
+		h.base.cnt_qkey            = cnt_addr.qkeys.dev;
+	};
+	set_cnt(counter_dev_handle.host[0]);
+	set_cnt(signal_dev_handle.host[0]);
+	counter_dev_handle.commit();
 	signal_dev_handle.commit();
 }
 

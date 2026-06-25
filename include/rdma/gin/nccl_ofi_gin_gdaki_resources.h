@@ -240,6 +240,57 @@ public:
 };
 
 /**
+ * Signal-target addressing table for one poster endpoint.
+ *
+ * Three GPU-resident arrays of size [nSignals * nranks] that let this
+ * endpoint post a signalling RDMA write addressed to the TARGET's signal
+ * endpoint `signalId` (the endpoint whose FI_REMOTE_WRITE counter the GIN
+ * waitSignal/readSignal observes), decoupled from which local endpoint
+ * posts. This is what makes the GIN signalId a target property.
+ *
+ * Laid out signalId-major: idx = signalId * nranks + peer. The plugin
+ * (createContext) writes this layout; NCCL's device code reads it — both
+ * must agree on signalId-major (see the dev-handle mirror).
+ *
+ * Built for the data endpoint and every sc endpoint, because any of them
+ * may post a signal-bearing Put/PutValue. Empty (no allocation) when
+ * nSignals == 0.
+ */
+class gdaki_signal_addressing {
+public:
+	gdaki_gpu_buf<uint16_t> ahs;      /* [nSignals*nranks] address handle numbers */
+	gdaki_gpu_buf<uint16_t> qpns;     /* [nSignals*nranks] remote QP numbers */
+	gdaki_gpu_buf<uint32_t> qkeys;    /* [nSignals*nranks] remote QKeys */
+
+	gdaki_signal_addressing() = default;
+	gdaki_signal_addressing(const gdaki_signal_addressing &) = delete;
+	gdaki_signal_addressing &operator=(const gdaki_signal_addressing &) = delete;
+
+	/*
+	 * For each signalId in [0, nSignals) and peer in [0, nranks),
+	 * insert peer's sc-endpoint[signalId] address into THIS endpoint's
+	 * AV, query the (ahn, qpn, qkey) tuple, and store it signalId-major
+	 * at [signalId * nranks + peer]. Commits the three tables to GPU
+	 * memory.
+	 *
+	 * nSignals here is the GLOBAL signal row count (max over peers of
+	 * their signal count), so the table can address the peer with the
+	 * most signal endpoints. A (signalId, peer) slot whose peer has no
+	 * sc-endpoint[signalId] is zero-filled in sig_peer_addrs and skipped
+	 * (the entry stays 0; the kernel never addresses it because it bounds
+	 * each post by the target peer's advertised signal count).
+	 *
+	 * sig_peer_addrs is a flat buffer of [nSignals][nranks] address
+	 * slots: sig_peer_addrs[(signalId * nranks + peer) * ep_addr_len]
+	 * holds peer's sc-endpoint[signalId] EP address (or zero if absent).
+	 */
+	void populate(gdaki_fi_endpoint &endpoint,
+		      const std::vector<uint8_t> &sig_peer_addrs,
+		      size_t ep_addr_len, int nSignals, int nranks,
+		      struct fi_efa_ops_gda *gda_ops);
+};
+
+/**
  * A GPU-resident efa_cuda_qp-compatible descriptor.
  *
  * Built from fi_efa_wq_attr returned by gda_ops->query_qp_wqs, plus
@@ -455,12 +506,46 @@ public:
 	gdaki_hw_counter write_cntr;        /* FI_WRITE (local completion) */
 	gdaki_endpoint   base;          /* AFTER counter → EP closes first */
 
+	/* Signal-target addressing: this endpoint's [nSignals*nranks]
+	 * table for posting signalling writes to any peer's signal
+	 * endpoint. Empty when nSignals == 0. The data endpoint can post a
+	 * signal-only Put/PutValue (it has a FI_WRITE counter), so it gets
+	 * this table too. */
+	gdaki_signal_addressing sig_addr;
+
+	/* Counter-target ("quiet sink") addressing: this endpoint's [nranks]
+	 * table for posting counter-only writes to each peer's DATA endpoint
+	 * (no FI_REMOTE_WRITE bound there), so a counter does not spuriously
+	 * fire a signal on the receiver. Resolved through this endpoint's own
+	 * AV. */
+	gdaki_peer_addressing cnt_addr;
+
 	/**
 	 * Open the inner endpoint, create the FI_WRITE counter, and bind
 	 * the counter before enabling.
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
 		  struct fi_efa_ops_gda *gda_ops);
+
+	/**
+	 * Build this endpoint's signal-target addressing table from the
+	 * gathered per-(signalId, peer) sc endpoint addresses. Resolves
+	 * through this endpoint's own AV. Must be called after open().
+	 * No-op when nSignals == 0.
+	 */
+	void build_signal_addressing(struct fi_efa_ops_gda *gda_ops,
+				     const std::vector<uint8_t> &sig_peer_addrs,
+				     size_t ep_addr_len, int nSignals, int nranks);
+
+	/**
+	 * Build this endpoint's counter-target ("quiet sink") table from the
+	 * gathered per-peer DATA endpoint addresses (data_peer_addrs is the
+	 * [nranks] data-EP address buffer). Resolves through this endpoint's
+	 * own AV. Must be called after open().
+	 */
+	void build_counter_addressing(struct fi_efa_ops_gda *gda_ops,
+				      const std::vector<uint8_t> &data_peer_addrs,
+				      size_t ep_addr_len, int nranks);
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors (QP/CQ attrs,
@@ -517,6 +602,20 @@ public:
 	 * counter_dev_handle; only cntr_value differs. */
 	gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle> signal_dev_handle;
 
+	/* Signal-target addressing: this sc endpoint's [nSignals*nranks]
+	 * table for posting signalling writes to any peer's signal
+	 * endpoint, decoupled from this endpoint's own index. Empty when
+	 * nSignals == 0. Exposed to the kernel through both dev handles'
+	 * base.sig_* pointers. */
+	gdaki_signal_addressing sig_addr;
+
+	/* Counter-target ("quiet sink") addressing: this sc endpoint's
+	 * [nranks] table for posting counter-only writes to each peer's DATA
+	 * endpoint (no FI_REMOTE_WRITE there), so a counter does not
+	 * spuriously fire a signal on the receiver. Exposed to the kernel
+	 * through both dev handles' base.cnt_* pointers. */
+	gdaki_peer_addressing cnt_addr;
+
 	/**
 	 * Open the inner endpoint with hardware counters bound. Creates
 	 * the counters, opens the inner EP without enable, binds the
@@ -532,6 +631,27 @@ public:
 	void populate(struct fi_efa_ops_gda *gda_ops,
 		      const std::vector<uint8_t> &peer_addrs,
 		      size_t ep_addr_len, int nranks);
+
+	/**
+	 * Build this endpoint's signal-target addressing table from the
+	 * gathered per-(signalId, peer) sc endpoint addresses, then publish
+	 * its GPU pointers into both dev handles' base.sig_* fields and
+	 * re-commit them. Must be called after populate() (which uploaded
+	 * the initial dev-handle host state). No-op when nSignals == 0.
+	 */
+	void build_signal_addressing(struct fi_efa_ops_gda *gda_ops,
+				     const std::vector<uint8_t> &sig_peer_addrs,
+				     size_t ep_addr_len, int nSignals, int nranks);
+
+	/**
+	 * Build this endpoint's counter-target ("quiet sink") table from the
+	 * gathered per-peer DATA endpoint addresses, then publish its GPU
+	 * pointers into both dev handles' base.cnt_* fields and re-commit
+	 * them. Must be called after populate().
+	 */
+	void build_counter_addressing(struct fi_efa_ops_gda *gda_ops,
+				      const std::vector<uint8_t> &data_peer_addrs,
+				      size_t ep_addr_len, int nranks);
 
 	/**
 	 * Set the PutValue slot pool slice base on both
@@ -557,8 +677,31 @@ struct nccl_ofi_gin_gdaki_context {
 	int nContexts = 0;
 	int nranks = 0;
 	int rank = 0;
-	int nSignals = 0;
-	int nCounters = 0;
+	int nSignals = 0;   /* this rank's local signal count  */
+	int nCounters = 0;  /* this rank's local counter count */
+
+	/* Asymmetric-count support. Ranks are NOT required to request the
+	 * same nSignals/nCounters for a context, so createContext allgathers
+	 * each rank's counts and derives:
+	 *   peer_n_sc[p]    = max(peer p's nSignals, nCounters)
+	 *                     = number of sc endpoints peer p created
+	 *   global_n_sc     = max over peers of peer_n_sc[p]
+	 *                     = number of collective sc-endpoint allgather
+	 *                       rounds every rank must run (a rank with fewer
+	 *                       sc EPs contributes a zero address in the
+	 *                       surplus rounds)
+	 *   global_nSignals = max over peers of peer p's nSignals
+	 *                     = row count of every poster's signal-target
+	 *                       table
+	 * peer_nSignals_host[p] is peer p's signal count; it is uploaded to
+	 * GPU (peer_nSignals_buf) and pointed at by every context's
+	 * dev_handle.peer_nSignals so the kernel can bound the target signalId
+	 * per peer. */
+	std::vector<int> peer_n_sc;          /* [nranks] host */
+	std::vector<int> peer_nSignals_host; /* [nranks] host */
+	int global_n_sc = 0;
+	int global_nSignals = 0;
+	gdaki_gpu_buf<int32_t> peer_nSignals_buf; /* [nranks] GPU, shared by all ctxs */
 
 	/* Per-ctx data (main) endpoint: libfabric EP on the reused proxy
 	 * domain plus its GPU-side SQ buffer/doorbell mappings, GPU-
