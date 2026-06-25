@@ -403,6 +403,19 @@ void gdaki_data_endpoint::build_signal_addressing(
 			  nSignals, nranks, gda_ops);
 }
 
+void gdaki_data_endpoint::build_counter_addressing(
+	struct fi_efa_ops_gda *gda_ops,
+	const std::vector<uint8_t> &data_peer_addrs,
+	size_t ep_addr_len, int nranks)
+{
+	/* Resolve the [nranks] counter-target table (peer data EPs) through
+	 * this (data) endpoint's own AV. Exposed via the top-level
+	 * dev_handle.data.cnt_* fields in populate_dev_handle; committed with
+	 * the whole dev_handles[] array, so no per-handle re-commit here. */
+	cnt_addr.populate(base.endpoint, data_peer_addrs, ep_addr_len,
+			  nranks, gda_ops);
+}
+
 void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
 			     struct fi_efa_ops_gda *gda_ops)
 {
@@ -495,6 +508,29 @@ void gdaki_sc_endpoint::build_signal_addressing(
 	};
 	set_sig(counter_dev_handle.host[0]);
 	set_sig(signal_dev_handle.host[0]);
+	counter_dev_handle.commit();
+	signal_dev_handle.commit();
+}
+
+void gdaki_sc_endpoint::build_counter_addressing(
+	struct fi_efa_ops_gda *gda_ops,
+	const std::vector<uint8_t> &data_peer_addrs,
+	size_t ep_addr_len, int nranks)
+{
+	/* Resolve the [nranks] counter-target table (peer data EPs) through
+	 * this sc endpoint's own AV. */
+	cnt_addr.populate(base.endpoint, data_peer_addrs, ep_addr_len,
+			  nranks, gda_ops);
+
+	/* Publish into both dev handles (the counter-only path may post from
+	 * either, selected by counterId) and re-commit. */
+	auto set_cnt = [&](nccl_ofi_gin_gdaki_dev_counter_handle &h) {
+		h.base.cnt_address_handles = cnt_addr.ahs.dev;
+		h.base.cnt_remote_qpns     = cnt_addr.qpns.dev;
+		h.base.cnt_qkey            = cnt_addr.qkeys.dev;
+	};
+	set_cnt(counter_dev_handle.host[0]);
+	set_cnt(signal_dev_handle.host[0]);
 	counter_dev_handle.commit();
 	signal_dev_handle.commit();
 }

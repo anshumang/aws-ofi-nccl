@@ -513,6 +513,13 @@ public:
 	 * this table too. */
 	gdaki_signal_addressing sig_addr;
 
+	/* Counter-target ("quiet sink") addressing: this endpoint's [nranks]
+	 * table for posting counter-only writes to each peer's DATA endpoint
+	 * (no FI_REMOTE_WRITE bound there), so a counter does not spuriously
+	 * fire a signal on the receiver. Resolved through this endpoint's own
+	 * AV. */
+	gdaki_peer_addressing cnt_addr;
+
 	/**
 	 * Open the inner endpoint, create the FI_WRITE counter, and bind
 	 * the counter before enabling.
@@ -529,6 +536,16 @@ public:
 	void build_signal_addressing(struct fi_efa_ops_gda *gda_ops,
 				     const std::vector<uint8_t> &sig_peer_addrs,
 				     size_t ep_addr_len, int nSignals, int nranks);
+
+	/**
+	 * Build this endpoint's counter-target ("quiet sink") table from the
+	 * gathered per-peer DATA endpoint addresses (data_peer_addrs is the
+	 * [nranks] data-EP address buffer). Resolves through this endpoint's
+	 * own AV. Must be called after open().
+	 */
+	void build_counter_addressing(struct fi_efa_ops_gda *gda_ops,
+				      const std::vector<uint8_t> &data_peer_addrs,
+				      size_t ep_addr_len, int nranks);
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors (QP/CQ attrs,
@@ -592,6 +609,13 @@ public:
 	 * base.sig_* pointers. */
 	gdaki_signal_addressing sig_addr;
 
+	/* Counter-target ("quiet sink") addressing: this sc endpoint's
+	 * [nranks] table for posting counter-only writes to each peer's DATA
+	 * endpoint (no FI_REMOTE_WRITE there), so a counter does not
+	 * spuriously fire a signal on the receiver. Exposed to the kernel
+	 * through both dev handles' base.cnt_* pointers. */
+	gdaki_peer_addressing cnt_addr;
+
 	/**
 	 * Open the inner endpoint with hardware counters bound. Creates
 	 * the counters, opens the inner EP without enable, binds the
@@ -618,6 +642,16 @@ public:
 	void build_signal_addressing(struct fi_efa_ops_gda *gda_ops,
 				     const std::vector<uint8_t> &sig_peer_addrs,
 				     size_t ep_addr_len, int nSignals, int nranks);
+
+	/**
+	 * Build this endpoint's counter-target ("quiet sink") table from the
+	 * gathered per-peer DATA endpoint addresses, then publish its GPU
+	 * pointers into both dev handles' base.cnt_* fields and re-commit
+	 * them. Must be called after populate().
+	 */
+	void build_counter_addressing(struct fi_efa_ops_gda *gda_ops,
+				      const std::vector<uint8_t> &data_peer_addrs,
+				      size_t ep_addr_len, int nranks);
 
 	/**
 	 * Set the PutValue slot pool slice base on both

@@ -249,6 +249,35 @@ struct nccl_ofi_gin_gdaki_dev_endpoint_handle {
 	uint16_t *sig_address_handles;   /* [nSignals * nranks] */
 	uint16_t *sig_remote_qpns;       /* [nSignals * nranks] */
 	uint32_t *sig_qkey;              /* [nSignals * nranks] */
+
+	/* Counter-target ("quiet sink") addressing for this (poster) endpoint.
+	 *
+	 * Three GPU-resident [nranks] arrays that let THIS endpoint post a
+	 * counter-only RDMA write (hasCounter && !hasSignal) addressed to
+	 * peer P's DATA endpoint. The data endpoint binds only FI_WRITE, no
+	 * FI_REMOTE_WRITE, so the write lands in memory and ticks this
+	 * (sender-local) counter's FI_WRITE completion WITHOUT firing any
+	 * signal on the receiver.
+	 *
+	 * This is the mirror of sig_*: a counter-only Put must NOT use the
+	 * poster's plain per-peer table (address_handles), because on a
+	 * counter (sc) endpoint that resolves to peer's same-index sc
+	 * endpoint, whose FI_REMOTE_WRITE counter IS GIN signal C on the
+	 * receiver — spuriously incrementing it. Routing to peer's data EP
+	 * avoids that. The write still posts from this endpoint's QP (so the
+	 * correct local counter ticks); only the remote target differs.
+	 *
+	 * Indexed by peer only ([nranks], no signalId/counterId dimension):
+	 * every counter on this rank targets the same peer data EP. Resolved
+	 * through this endpoint's OWN AV against peer P's data EP address.
+	 * Built for the data endpoint and every sc endpoint. NULL when
+	 * nranks == 0 (never, in practice always populated).
+	 *
+	 * Layout is shared with the NCCL mirror in
+	 * nccl_device/gin/efa_gda/gin_efa_gda_dev.h — keep them in sync. */
+	uint16_t *cnt_address_handles;   /* [nranks] */
+	uint16_t *cnt_remote_qpns;       /* [nranks] */
+	uint32_t *cnt_qkey;              /* [nranks] */
 };
 
 /**
