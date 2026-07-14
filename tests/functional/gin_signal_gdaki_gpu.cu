@@ -12,8 +12,8 @@
  *
  * No plugin-internal mhandle / sc_endpoint reach-through: everything is
  * driven through the public dev->signal_handles[] contract that the
- * kernel uses in production. dev->signal_handles[i]->cntr_value is the
- * FI_REMOTE_WRITE counter (the receiver sees this increment);
+ * kernel uses in production. dev->signal_handles[i]->remote_write_value is
+ * the FI_REMOTE_WRITE counter (the receiver sees this increment);
  * dev->signal_handles[i]->base.local_cntr_value is the FI_WRITE counter
  * (the sender sees this increment).
  *
@@ -37,7 +37,7 @@ struct proc_handle {
  *
  * Single-thread (gridDim=1, blockDim=1). All other lanes early-return.
  */
-__global__ void gin_signal_gpu_kernel(nccl_ofi_gin_gdaki_dev_counter_handle *sig,
+__global__ void gin_signal_gpu_kernel(nccl_ofi_gin_gdaki_dev_signal_handle *sig,
 				      int peer,
 				      int nranks,
 				      uint64_t dst_addr,
@@ -210,7 +210,7 @@ int main(int argc, char *argv[])
 	/* The dev_handle gives us GPU pointers to the per-rank
 	 * signal_handles array. Pull host-side copies of:
 	 *   - the signal_handles[0] device handle pointer (for kernel arg)
-	 *   - cntr_value         = FI_REMOTE_WRITE counter (receiver sees++)
+	 *   - remote_write_value = FI_REMOTE_WRITE counter (receiver sees++)
 	 *   - base.local_cntr_value = FI_WRITE counter    (sender sees++) */
 	auto *dev_h_gpu =
 		reinterpret_cast<nccl_ofi_gin_gdaki_dev_handle *>(devHandle->handle);
@@ -223,15 +223,15 @@ int main(int argc, char *argv[])
 		return ncclInternalError;
 	}
 
-	nccl_ofi_gin_gdaki_dev_counter_handle *sig_dev_gpu = nullptr;
+	nccl_ofi_gin_gdaki_dev_signal_handle *sig_dev_gpu = nullptr;
 	CUDACHECK(cudaMemcpy(&sig_dev_gpu, h_dev.signal_handles,
 			     sizeof(sig_dev_gpu), cudaMemcpyDeviceToHost));
 
-	nccl_ofi_gin_gdaki_dev_counter_handle h_sig = {};
+	nccl_ofi_gin_gdaki_dev_signal_handle h_sig = {};
 	CUDACHECK(cudaMemcpy(&h_sig, sig_dev_gpu, sizeof(h_sig), cudaMemcpyDeviceToHost));
 
 	uint64_t rw_cntr_before = 0, w_cntr_before = 0;
-	CUDACHECK(cudaMemcpy(&rw_cntr_before, (void *)h_sig.cntr_value,
+	CUDACHECK(cudaMemcpy(&rw_cntr_before, (void *)h_sig.remote_write_value,
 			     sizeof(uint64_t), cudaMemcpyDeviceToHost));
 	CUDACHECK(cudaMemcpy(&w_cntr_before, (void *)h_sig.base.local_cntr_value,
 			     sizeof(uint64_t), cudaMemcpyDeviceToHost));
@@ -292,7 +292,7 @@ int main(int argc, char *argv[])
 	if (rank == 1) {
 		uint64_t rw = rw_cntr_before;
 		for (int i = 0; i < 100000000; i++) {
-			CUDACHECK(cudaMemcpy(&rw, (void *)h_sig.cntr_value,
+			CUDACHECK(cudaMemcpy(&rw, (void *)h_sig.remote_write_value,
 					     sizeof(uint64_t), cudaMemcpyDeviceToHost));
 			if (rw != rw_cntr_before) break;
 		}
@@ -300,7 +300,7 @@ int main(int argc, char *argv[])
 
 	/* Both ranks: re-read counters and validate. */
 	uint64_t rw_cntr_after = 0, w_cntr_after = 0;
-	CUDACHECK(cudaMemcpy(&rw_cntr_after, (void *)h_sig.cntr_value,
+	CUDACHECK(cudaMemcpy(&rw_cntr_after, (void *)h_sig.remote_write_value,
 			     sizeof(uint64_t), cudaMemcpyDeviceToHost));
 	CUDACHECK(cudaMemcpy(&w_cntr_after, (void *)h_sig.base.local_cntr_value,
 			     sizeof(uint64_t), cudaMemcpyDeviceToHost));

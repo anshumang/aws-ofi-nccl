@@ -256,40 +256,46 @@ struct nccl_ofi_gin_gdaki_dev_endpoint_handle {
 };
 
 /**
- * Per-signal/counter endpoint handle, visible to device code.
+ * Per-counter endpoint handle, visible to device code.
  *
- * Composes nccl_ofi_gin_gdaki_dev_endpoint_handle (qp / cq / addressing /
- * sq_lock / counter completion tracking) and adds the hardware counter
- * value pointer that the kernel reads to observe signal arrivals
- * (FI_REMOTE_WRITE) or counter increments (FI_WRITE). The hardware
- * counter value lives in GPU memory and is updated by the NIC directly.
- *
- * For signals: the GPU kernel reads *cntr_value to detect remote writes
- *              (FI_REMOTE_WRITE counter). The target table lets
- *              the sender target this QP on the remote rank.
- *
- * For counters: the GPU kernel reads *cntr_value to track local write
- *               completions (FI_WRITE counter). The QP is used by the
- *               local rank to post writes that need completion tracking.
+ * A counter endpoint is a local poster whose one FI_WRITE counter serves
+ * both roles: the raw value in base.local_cntr_value is read by the
+ * device backpressure / Flush paths, and the same counter (offset-adjusted
+ * by cntr_offset) is the app-facing GetCounter / ResetCounter value. There
+ * is deliberately no separate app-facing pointer — the two views cannot
+ * disagree because they read the same field. Returned via counter_handles[].
  *
  * Layout is shared with the NCCL mirror in
  * nccl_device/gin/efa_gda/gin_efa_gda_dev.h — keep them in sync.
  */
 struct nccl_ofi_gin_gdaki_dev_counter_handle {
-	/* Endpoint-common fields (qp, cq, addressing, sq_lock,
-	 * counter completion tracking). */
+	/* Endpoint-common fields; base.local_cntr_value IS the FI_WRITE counter. */
 	struct nccl_ofi_gin_gdaki_dev_endpoint_handle base;
 
-	/* Pointer to the hardware counter value in GPU-accessible memory.
-	 * For signals: FI_REMOTE_WRITE count. For counters: FI_WRITE count. */
-	volatile uint64_t *cntr_value;
+	/* Reset baseline for offset-based reset; app-facing reads only. */
+	uint64_t cntr_offset;
+};
 
-	/* Reset baseline for offset-based (reset-without-zeroing) semantics.
-	 * The NIC counter cannot be written by software, so ResetSignal /
-	 * ResetCounter snapshot the current cntr_value into cntr_offset
-	 * instead of zeroing the counter. Reads/waits subtract cntr_offset,
-	 * making the signal/counter appear reset without modifying the
-	 * NIC-visible value. Initialized to 0 at populate() time. */
+/**
+ * Per-signal endpoint handle, visible to device code.
+ *
+ * A signal endpoint carries two genuinely distinct hardware counters: the
+ * FI_WRITE counter in base.local_cntr_value (raw, for backpressure / Flush
+ * on locally-posted writes) and the FI_REMOTE_WRITE counter in
+ * remote_write_value (offset-adjusted, the app-facing signal the kernel's
+ * waitSignal observes). Returned via signal_handles[].
+ *
+ * Layout is shared with the NCCL mirror in
+ * nccl_device/gin/efa_gda/gin_efa_gda_dev.h — keep them in sync.
+ */
+struct nccl_ofi_gin_gdaki_dev_signal_handle {
+	/* Endpoint-common fields; base.local_cntr_value IS the FI_WRITE counter. */
+	struct nccl_ofi_gin_gdaki_dev_endpoint_handle base;
+
+	/* FI_REMOTE_WRITE counter in GPU memory; app-facing signal value. */
+	volatile uint64_t *remote_write_value;
+
+	/* Reset baseline for offset-based reset; app-facing reads only. */
 	uint64_t cntr_offset;
 };
 
@@ -321,7 +327,7 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 	struct nccl_ofi_gin_gdaki_dev_counter_handle **counter_handles;
 
 	/* Per-signal device handle array, [nSignals]. NULL when nSignals == 0. */
-	struct nccl_ofi_gin_gdaki_dev_counter_handle **signal_handles;
+	struct nccl_ofi_gin_gdaki_dev_signal_handle **signal_handles;
 
 	/* Number of counter_handles entries. 0 means counter_handles is NULL. */
 	int32_t nCounters;

@@ -539,13 +539,10 @@ public:
 	gdaki_hw_counter write_cntr;        /* FI_WRITE (local completion) */
 	gdaki_hw_counter remote_write_cntr; /* FI_REMOTE_WRITE (signal) */
 	gdaki_endpoint   base;          /* AFTER counters → EP closes first */
-	/* counter_dev_handle exposes the WRITE (local completion) counter via cntr_value.
-	 * Returned to the kernel through counter_handles[]. */
+	/* Counter view: base.local_cntr_value IS the FI_WRITE counter. Returned via counter_handles[]. */
 	gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle> counter_dev_handle;
-	/* signal_dev_handle exposes the REMOTE_WRITE (signal) counter via cntr_value.
-	 * Returned to the kernel through signal_handles[]. Same QP/CQ/addressing as
-	 * counter_dev_handle; only cntr_value differs. */
-	gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle> signal_dev_handle;
+	/* Signal view: base.local_cntr_value = FI_WRITE, remote_write_value = FI_REMOTE_WRITE. Returned via signal_handles[]. */
+	gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_signal_handle> signal_dev_handle;
 
 	/**
 	 * Open the inner endpoint with hardware counters bound. Creates
@@ -671,7 +668,7 @@ struct nccl_ofi_gin_gdaki_context {
 	 * for the same reason as `data` — gdaki_gpu_buf<T> is
 	 * non-movable. */
 	std::vector<std::unique_ptr<gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle *>>> d_counter_handles; /* [nContexts] */
-	std::vector<std::unique_ptr<gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle *>>> d_signal_handles;  /* [nContexts] */
+	std::vector<std::unique_ptr<gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_signal_handle *>>> d_signal_handles;  /* [nContexts] */
 
 	/* Shared signal-only scratch buffer.
 	 *

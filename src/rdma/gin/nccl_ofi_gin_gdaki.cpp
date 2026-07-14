@@ -659,7 +659,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			ctx->d_counter_handles[ctx_id] =
 			    std::make_unique<gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle *>>();
 			ctx->d_signal_handles[ctx_id] =
-			    std::make_unique<gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle *>>();
+			    std::make_unique<gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_signal_handle *>>();
 		}
 		ctx->dev_handles.allocate(nContexts);
 
@@ -786,7 +786,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			/* Build this rank's own counter/signal handle arrays from
 			 * its LOCAL counts (these are the endpoints this rank
 			 * exposes as targets / uses as counters). */
-			auto build_handle_array = [&](gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle *> &buf,
+			auto build_handle_array = [&](auto &buf,
 						      int count, auto get_dev_handle) {
 				if (count > 0) {
 					buf.allocate(count);

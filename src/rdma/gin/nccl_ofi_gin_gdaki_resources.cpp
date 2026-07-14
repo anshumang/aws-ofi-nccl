@@ -375,22 +375,13 @@ void gdaki_sc_endpoint::populate(struct fi_efa_ops_gda *gda_ops,
 	base.populate(gda_ops, all_addrs, ep_addr_len, total_slots, nranks);
 
 	/*
-	 * Build the two device handles. They share QP / CQ / target
-	 * addressing / sq_lock / sq_size / submitted_count layout — only
-	 * the (cntr_value, local_cntr_value) pair differs.
-	 *
-	 * - counter_dev_handle exposes the WRITE counter via cntr_value
-	 *   (FI_WRITE — local completion). Returned to the kernel through
-	 *   counter_handles[].
-	 * - signal_dev_handle exposes the REMOTE_WRITE counter via cntr_value
-	 *   (FI_REMOTE_WRITE — signal arrival), and the WRITE counter via
-	 *   local_cntr_value (used by the device for backpressure / Flush).
-	 *   Returned to the kernel through signal_handles[].
-	 *
-	 * Both `cntr_value` and `local_cntr_value` are set on the host before
-	 * commit() pushes the struct to GPU memory.
+	 * Build the two device handles over the same endpoint. Both set
+	 * base.local_cntr_value to the FI_WRITE counter — the raw value the
+	 * device backpressure / Flush read. The counter handle needs nothing
+	 * more (its app value IS that FI_WRITE counter); the signal handle
+	 * adds remote_write_value = FI_REMOTE_WRITE for the app-facing signal.
 	 */
-	auto fill_common = [&](nccl_ofi_gin_gdaki_dev_counter_handle &h) {
+	auto fill_common = [&](auto &h) {
 		h.base.qp = base.gpu_qp.dev();
 		h.base.cq = base.gpu_cq.dev();
 		h.base.target_address_handles = base.targets.ahs.dev;
@@ -399,18 +390,16 @@ void gdaki_sc_endpoint::populate(struct fi_efa_ops_gda *gda_ops,
 		h.base.sq_lock = 0;
 		h.base.submitted_count = 0;
 		h.base.sq_size = base.sq_size;
+		h.base.local_cntr_value = write_cntr.gpu_ptr();
 		h.cntr_offset = 0;   /* offset-based reset baseline */
 	};
 
 	counter_dev_handle.allocate(1);
 	fill_common(counter_dev_handle.host[0]);
-	counter_dev_handle.host[0].cntr_value = write_cntr.gpu_ptr();
-	counter_dev_handle.host[0].base.local_cntr_value = nullptr; /* unused on counter handles */
 	counter_dev_handle.commit();
 
 	signal_dev_handle.allocate(1);
 	fill_common(signal_dev_handle.host[0]);
-	signal_dev_handle.host[0].cntr_value = remote_write_cntr.gpu_ptr();
-	signal_dev_handle.host[0].base.local_cntr_value = write_cntr.gpu_ptr();
+	signal_dev_handle.host[0].remote_write_value = remote_write_cntr.gpu_ptr();
 	signal_dev_handle.commit();
 }
