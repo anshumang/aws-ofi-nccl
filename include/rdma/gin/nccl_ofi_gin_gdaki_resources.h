@@ -471,7 +471,7 @@ private:
  * Host-side state for a libfabric endpoint plus its GPU-side queue
  * descriptors and target addressing table.
  *
- * Used directly for the data (main) endpoint, and composed inside
+ * Used by the data and dedicated PutValue endpoints, and composed inside
  * gdaki_sc_endpoint for the signal/counter endpoints.
  *
  * Owns: fid_ep + fid_cq + fid_av (via gdaki_fi_endpoint), GPU-mapped
@@ -520,23 +520,24 @@ public:
 };
 
 /**
- * Host-side state for the data (main) endpoint.
+ * Host-side state for a data-like outbound endpoint.
  *
  * Composes a gdaki_endpoint plus a hardware counter for tracking local
- * completion of the operations this endpoint posts; open() takes the
- * operations to count. The kernel spins on this counter (instead of
- * polling the CQ) to determine when Put or Get has completed locally;
+ * completion of the operations it posts; open() takes the operations to
+ * count. The main data endpoint counts writes and reads, while the
+ * dedicated PutValue endpoint counts writes. The kernel spins on this
+ * counter (instead of polling the CQ) to determine local completion;
  * same model as gdaki_sc_endpoint, just without the FI_REMOTE_WRITE
- * counter (the data EP isn't a signal target).
+ * counter (these endpoints are not signal targets).
  *
  * Member declaration order is critical: local_cntr MUST be declared
  * BEFORE base so the inner libfabric endpoint closes before the
  * counter bound to it (closing a counter while it is still bound to
  * an open endpoint returns EBUSY in libfabric).
  *
- * The SQ ring depth is exposed via base.sq_size after populate()
- * returns; createContext uses it to populate the dev_handle.data field
- * the device-side SQ-overflow backpressure check reads.
+ * The SQ ring depth is exposed via base.sq_size after populate() returns;
+ * createContext publishes it through the corresponding dev_handle.data or
+ * dev_handle.pvdata field for device-side SQ-overflow backpressure.
  */
 class gdaki_data_endpoint {
 public:
@@ -566,19 +567,6 @@ public:
 	void populate(int backend_version, struct fi_efa_ops_gda *gda_ops,
 		      const std::vector<uint8_t> &all_addrs,
 		      size_t ep_addr_len, int total_slots, int nranks);
-
-	/**
-	 * Stash the PutValue slot pool slice base for this endpoint.
-	 * Read by populate_dev_handle() when filling
-	 * dev_handle.data.putvalue_slice_base. No commit here — the data
-	 * endpoint is uploaded as part of the top-level dev_handle.commit()
-	 * at the end of createContext.
-	 */
-	void set_putvalue_slice_base(uint64_t slice_base) { putvalue_slice_base = slice_base; }
-
-	/* Host stash for the slice base; uploaded to GPU memory by
-	 * populate_dev_handle(). */
-	uint64_t putvalue_slice_base = 0;
 };
 
 /**
@@ -633,13 +621,13 @@ public:
 };
 
 /**
- * Per-rail registrations of the context's two SHARED local source buffers
- * (the signal-only scratch buffer and the PutValue source slot pool). Both
- * are only local sources for RDMA writes, never remote targets.
+ * Per-rail registration and addressing metadata for the context's shared
+ * signal-only scratch buffer. The buffer is used as both the local source
+ * and remote target of signal-only writes.
  *
- * The buffers are allocated once per createContext; each rail has its own
- * domain, so each is registered per rail, giving a distinct local lkey. A
- * logical context c bound to rail r reads its lkeys from rail_shared[r].
+ * The buffer is allocated once per createContext; each rail has its own
+ * domain, so it is registered per rail, giving a distinct local lkey. A
+ * logical context c bound to rail r reads its lkey from rail_shared[r].
  * Only the first effective_rails = min(nContexts, num_rails) are populated.
  */
 struct gdaki_rail_shared {
@@ -647,26 +635,16 @@ struct gdaki_rail_shared {
 	gdaki_rail_shared(const gdaki_rail_shared &) = delete;
 	gdaki_rail_shared &operator=(const gdaki_rail_shared &) = delete;
 
-	/* Scratch buffer MR on this rail (local source only; the signal-only
-	 * 0-byte write has a zero remote target, so no per-peer rkey table). */
+	/* Scratch buffer MR on this rail. Its lkey covers the local source;
+	 * the per-peer address and rkey tables identify remote targets. */
 	struct fid_mr *scratch_mr = nullptr;
 	uint32_t scratch_lkey = 0;
 	gdaki_gpu_buf<uint64_t> scratch_remote_addrs_buf; /* [nranks] */
 	gdaki_gpu_buf<uint32_t> scratch_remote_rkeys_buf; /* [nranks] */
 
-	/* PutValue pool MR on this rail. */
-	struct fid_mr *putvalue_mr = nullptr;
-	uint32_t putvalue_lkey = 0;
-
 	~gdaki_rail_shared()
 	{
-		/* Close MRs before the shared buffers they cover are freed
-		 * (the buffers live on the parent context, destroyed after
-		 * this array per reverse-declaration order). */
-		if (putvalue_mr) {
-			fi_close(&putvalue_mr->fid);
-			putvalue_mr = nullptr;
-		}
+		/* Close the MR before the shared buffer it covers is freed. */
 		if (scratch_mr) {
 			fi_close(&scratch_mr->fid);
 			scratch_mr = nullptr;
@@ -713,8 +691,8 @@ struct nccl_ofi_gin_gdaki_context {
 	 * effective_rails = min(nContexts, num_rails) is how many rails are
 	 * actually used: logical context c is bound to rail c % num_rails,
 	 * so with fewer contexts than rails some rails go idle.
-	 * The shared scratch / putvalue buffers are registered on each of
-	 * the first effective_rails rails. */
+	 * The shared scratch buffer is registered on each of the first
+	 * effective_rails rails. */
 	uint16_t num_rails = 0;
 	uint16_t effective_rails = 0;
 
@@ -769,60 +747,19 @@ struct nccl_ofi_gin_gdaki_context {
 	/* Contiguous GPU-resident array of device handles, one entry per
 	 * logical context. The kernel reads
 	 *   &((nccl_ofi_gin_gdaki_dev_handle*)ctx.handle)[ctx.contextId]
-	 * to pick its entry. Populated last, after every per-ctx
-	 * endpoint is built, then committed once. */
+	 * to pick its entry. Each host entry is populated after that context's
+	 * endpoints are built; the complete array is committed once. */
 	gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_handle> dev_handles;
 
-	/* PutValue source slot pool, shared across every logical context's
-	 * data endpoint and signal/counter endpoints.
-	 *
-	 * The pool lives in GPU memory allocated via the CUDA VMM API
-	 * (so DMA-BUF export is supported), registered with libfabric as
-	 * FI_HMEM_CUDA / FI_MR_DMABUF. The kernel writes srcVal to the
-	 * staging slot; the NIC DMAs it from GPU HBM directly.
-	 *
-	 * No dedicated PutValue endpoint: the WQE rides on whichever
-	 * endpoint matches the caller's signal request (data endpoint when
-	 * signal == NONE, sc_endpoints[signalId] otherwise). The pool is
-	 * sliced per endpoint, sized to the sum over every context of each
-	 * participating endpoint's sq_size; per-endpoint slice descriptors
-	 * are uploaded to the device via dev_handle->putvalue_slice_base.
-	 *
-	 * putvalue_buf         : GPU pointer (== putvalue_local_addr)
-	 * putvalue_pool_bytes  : VMM-rounded size; pass back to vmm_free
-	 * putvalue_dmabuf_fd   : DMA-BUF fd; close in dtor (-1 = unset)
-	 * putvalue_slot_size   : 8 bytes per slot (T <= 8 bytes)
-	 *
-	 * Like scratch, the pool is allocated once; its per-rail MR
-	 * registrations (lkey) live in rail_shared[r]. */
-	void *putvalue_buf = nullptr;
-	int putvalue_dmabuf_fd = -1;
-	uint64_t putvalue_local_addr = 0;
-	size_t putvalue_pool_bytes = 0;
-	size_t putvalue_slot_size = NCCL_OFI_GDAKI_PUTVALUE_SLOT_SIZE;
-
-	/* Per-rail registrations of the two shared buffers above. Indexed
-	 * by rail id; only [0, effective_rails) are populated. Declared
-	 * after scratch_buf / putvalue_buf so the MRs (closed in
-	 * gdaki_rail_shared's dtor) are torn down BEFORE the buffers they
-	 * cover are freed below — C++ destroys members in reverse
-	 * declaration order. */
+	/* Per-rail registration and addressing metadata for the shared scratch
+	 * buffer. Indexed by rail id; only [0, effective_rails) are populated. */
 	std::array<std::unique_ptr<gdaki_rail_shared>, NCCL_OFI_GDAKI_MAX_RAILS> rail_shared;
 
 	~nccl_ofi_gin_gdaki_context()
 	{
-		/* Tear down per-rail MRs first (closes scratch/putvalue MRs on
-		 * each rail) before the shared buffers they cover are freed. */
+		/* Tear down per-rail MRs before freeing the shared scratch buffer. */
 		for (auto &rs : rail_shared) {
 			rs.reset();
-		}
-		if (putvalue_dmabuf_fd >= 0) {
-			close(putvalue_dmabuf_fd);
-			putvalue_dmabuf_fd = -1;
-		}
-		if (putvalue_buf) {
-			nccl_net_ofi_gpu_vmm_free(putvalue_buf, putvalue_pool_bytes);
-			putvalue_buf = nullptr;
 		}
 		if (scratch_buf) {
 			free(scratch_buf);

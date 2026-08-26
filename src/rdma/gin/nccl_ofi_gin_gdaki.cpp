@@ -312,130 +312,6 @@ static void setup_scratch_buffer(nccl_ofi_gin_gdaki_context *ctx,
 }
 
 /*
- * Set up the PutValue source slot pool, shared across every logical
- * context's data endpoint and signal/counter (sc) endpoints.
- *
- * EFA's RDMA_WRITE WQE cannot use inline data, so PutValue stages each
- * value through a registered local source slot then RDMA-writes the
- * slot to the user's destination. The same WQE arrival on the receiver's
- * sc_endpoint bumps that endpoint's FI_REMOTE_WRITE counter, giving us
- * value-and-signal in one WQE; routing matches Put.
- *
- * No QP/EP is opened here: the WQE rides on whichever endpoint the
- * kernel selects (data or sc). The pool is one contiguous GPU-VMM
- * region registered as a single FI_HMEM_CUDA / FI_MR_DMABUF MR, sized
- * to the sum over all contexts of (data.sq_size + sum sc_endpoints[i].
- * sq_size) slots. Per-endpoint slice descriptors are uploaded so the
- * kernel can locate its slot range without sharing an allocator across
- * endpoints.
- *
- * Must be called after every context's data and sc_endpoints have been
- * populated so each sq_size is finalized.
- */
-static void setup_putvalue_pool(nccl_ofi_gin_gdaki_context *ctx,
-				nccl_ofi_rdma_gin_put_comm *put_comm)
-{
-	const int nContexts = ctx->nContexts;
-
-	/* One pool slice per context, holding pvdata[c].sq_size slots. Total =
-	 * sum over contexts of pvdata[c].sq_size. */
-	uint64_t total_slots = 0;
-	for (int c = 0; c < nContexts; c++) {
-		if (ctx->pvdata[c]->base.sq_size == 0) {
-			throw std::runtime_error(
-				"putvalue: pvdata endpoint sq_size is zero (ctx " +
-				std::to_string(c) + ")");
-		}
-		total_slots += ctx->pvdata[c]->base.sq_size;
-	}
-
-	ctx->putvalue_slot_size = NCCL_OFI_GDAKI_PUTVALUE_SLOT_SIZE;
-	const size_t requested_bytes = (size_t)total_slots * ctx->putvalue_slot_size;
-
-	/* Allocate GPU memory via VMM (cuMemCreate + cuMemMap with
-	 * gpuDirectRDMACapable) so we can export a DMA-BUF for libfabric
-	 * MR registration. The actual size returned is rounded up to the
-	 * VMM granularity (typically 2 MiB on B200) — store that back so
-	 * vmm_free in the destructor passes the correct size. */
-	void *gpu_pool = nullptr;
-	size_t actual_size = 0;
-	if (nccl_net_ofi_gpu_vmm_alloc(&gpu_pool, requested_bytes, &actual_size) != 0) {
-		throw std::runtime_error("putvalue gpu_vmm_alloc failed");
-	}
-	ctx->putvalue_buf = gpu_pool;
-	ctx->putvalue_pool_bytes = actual_size;
-
-	/* Get DMA-BUF fd. The DMA-BUF must cover the full mapped region
-	 * (rounded to VMM granularity), not just the bytes we use. */
-	int pv_fd = -1;
-	size_t pv_fd_offset = 0;
-	if (nccl_net_ofi_gpu_get_dma_buf_fd(gpu_pool, actual_size, &pv_fd, &pv_fd_offset) != 0) {
-		/* putvalue_buf / putvalue_pool_bytes are already set, so the ctx
-		 * destructor frees the VMM allocation on this throw path, the
-		 * same way it does for the get_gpu_device_for_addr and
-		 * fi_mr_regattr failures below. No manual free here. */
-		throw std::runtime_error("putvalue get_dma_buf_fd failed");
-	}
-	ctx->putvalue_dmabuf_fd = pv_fd;
-
-	/* CUDA device id for FI_HMEM_CUDA */
-	int cuda_dev = 0;
-	if (nccl_net_ofi_get_gpu_device_for_addr(gpu_pool, &cuda_dev) != 0) {
-		throw std::runtime_error("putvalue get_gpu_device_for_addr failed");
-	}
-
-	ctx->putvalue_local_addr = (uint64_t)gpu_pool;
-
-	/* Register the one shared pool on each used rail's domain. The
-	 * pool's GPU VA (and hence every endpoint's slice base) is the same
-	 * across rails; only the lkey differs per rail. A logical context
-	 * bound to rail r reads its putvalue lkey from rail_shared[r]. */
-	auto &domain = put_comm->get_resources().get_ep().get_domain();
-	for (uint16_t r = 0; r < ctx->effective_rails; r++) {
-		struct fid_domain *dom_r = domain.get_ofi_domain(r).get();
-		if (dom_r == nullptr) {
-			throw std::runtime_error(
-				"putvalue: rail " + std::to_string(r) + " domain is null");
-		}
-		auto &rs = *ctx->rail_shared[r];
-
-		struct fi_mr_dmabuf pv_dmabuf = {};
-		pv_dmabuf.fd        = pv_fd;
-		pv_dmabuf.offset    = pv_fd_offset;
-		pv_dmabuf.len       = actual_size;
-		pv_dmabuf.base_addr = gpu_pool;
-
-		struct fi_mr_attr pv_mr_attr = {};
-		pv_mr_attr.dmabuf      = &pv_dmabuf;
-		pv_mr_attr.iov_count   = 1;
-		pv_mr_attr.access      = FI_WRITE;
-		pv_mr_attr.iface       = FI_HMEM_CUDA;
-		pv_mr_attr.device.cuda = cuda_dev;
-		pv_mr_attr.requested_key = 0;
-
-		int ret = fi_mr_regattr(dom_r, &pv_mr_attr, FI_MR_DMABUF, &rs.putvalue_mr);
-		if (ret != 0) {
-			throw std::runtime_error(
-				"putvalue fi_mr_regattr (rail " + std::to_string(r) +
-				", FI_MR_DMABUF, FI_HMEM_CUDA) failed: " +
-				std::string(fi_strerror(-ret)));
-		}
-		rs.putvalue_lkey = (uint32_t)fi_mr_key(rs.putvalue_mr);
-	}
-
-	/* Assign each context's pool slice to its dedicated PutValue endpoint
-	 * (pvdata). The slice base is stashed on pvdata's host state and uploaded
-	 * later by populate_dev_handle into dev_handle.pvdata.putvalue_slice_base.
-	 * Slices are laid out context-major, each pvdata[c].sq_size slots. */
-	uint64_t cursor = ctx->putvalue_local_addr;
-	for (int c = 0; c < nContexts; c++) {
-		ctx->pvdata[c]->set_putvalue_slice_base(cursor);
-		cursor += (uint64_t)ctx->pvdata[c]->base.sq_size * ctx->putvalue_slot_size;
-	}
-}
-
-
-/*
  * Fill one entry of the contiguous dev_handles[] GPU array for logical
  * context `ctx_id`. Caller (createContext) owns the GPU buffer; this
  * function only writes the host-side copy. The whole array is committed
@@ -455,6 +331,8 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle &h,
 	h.data.local_cntr_value = ctx->data[ctx_id]->local_cntr.gpu_ptr();
 	h.data.submitted_count = 0;
 	h.data.sq_size = ctx->data[ctx_id]->base.sq_size;
+	h.data.putvalue_pad = 0;
+	h.data.putvalue_slice_base = 0;
 
 	/* Dedicated PutValue poster endpoint: same field set as data. Its target
 	 * table resolves the same peer target slots (built in populate above). */
@@ -467,7 +345,8 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle &h,
 	h.pvdata.local_cntr_value = ctx->pvdata[ctx_id]->local_cntr.gpu_ptr();
 	h.pvdata.submitted_count = 0;
 	h.pvdata.sq_size = ctx->pvdata[ctx_id]->base.sq_size;
-	h.pvdata.putvalue_slice_base = ctx->pvdata[ctx_id]->putvalue_slice_base;
+	h.pvdata.putvalue_pad = 0;
+	h.pvdata.putvalue_slice_base = 0;
 
 	h.counter_handles = (ctx->nCounters > 0) ? ctx->d_counter_handles[ctx_id]->dev : nullptr;
 	h.signal_handles  = (ctx->nSignals  > 0) ? ctx->d_signal_handles[ctx_id]->dev  : nullptr;
@@ -478,8 +357,8 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle &h,
 
 	/* Multi-rail: bind this logical context to rail (ctx_id % num_rails).
 	 * The kernel reads rail_id to select the matching per-rail mr_handle
-	 * from the window; the scratch / putvalue keys below are pulled from
-	 * this rail's shared registration so they're already rail-resolved. */
+	 * from the window; the scratch key below is pulled from this rail's
+	 * shared registration so it is already rail-resolved. */
 	const uint16_t rail_id = (uint16_t)(ctx_id % ctx->num_rails);
 	const auto &rs = *ctx->rail_shared[rail_id];
 	h.rail_id = rail_id;
@@ -489,14 +368,11 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle &h,
 	h.scratch_local_addr   = ctx->scratch_local_addr;
 	h.scratch_remote_addrs = rs.scratch_remote_addrs_buf.dev;
 	h.scratch_remote_rkeys = rs.scratch_remote_rkeys_buf.dev;
-	/* PutValue slot pool. slot_size and the pool base are rail-independent
-	 * (one pool, same GPU VA on every rail); the per-context pool base lives
-	 * on pvdata (set above from ctx->pvdata[ctx_id]->putvalue_slice_base).
-	 * Only the lkey is per-rail (from rail_shared[rail_id]). No commit here —
-	 * the caller commits the whole dev_handles[] array once after every entry
-	 * is filled. */
-	h.putvalue_lkey            = rs.putvalue_lkey;
-	h.putvalue_slot_size       = (uint32_t)ctx->putvalue_slot_size;
+
+	/* Backend version 1 setup will populate these staging fields before the
+	 * device-handle array is committed. Backend version 2 leaves them zero. */
+	h.putvalue_lkey = 0;
+	h.putvalue_slot_size = 0;
 }
 
 /* `backend_version` must already be validated by the caller; see
@@ -546,12 +422,13 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 	/*
 	 * TODO: Upfront EFA hardware-counter capacity check.
 	 *
-	 * Each ctx allocates 1 FI_WRITE counter on the data EP plus
+	 * Each ctx allocates one FI_WRITE counter on the data EP, one
+	 * FI_WRITE counter on the dedicated PutValue EP, and
 	 * (FI_WRITE + FI_REMOTE_WRITE) on each of its
 	 * max(nSignals, nCounters) sc EPs. When the total request exceeds
 	 * the per-NIC counter budget, cntr_open_ext returns -FI_ENOMEM
-	 * mid-loop and we tear down a partially-built ctx via the
-	 * exception path with a generic error.
+	 * mid-loop and we tear down a partially-built ctx via the exception
+	 * path with a generic error.
 	 *
 	 * Today libfabric reports domain_attr->cntr_cnt = 0 on EFA because
 	 * the EFA driver does not populate ibv_query_device_ex's
@@ -597,9 +474,9 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		 * are valid on the endpoints we open here.
 		 *
 		 * Multi-rail: logical context c is bound to rail
-		 * c % num_rails, so its data + sc endpoints open on that rail's
-		 * domain. effective_rails = min(nContexts, num_rails) is how
-		 * many rails get used (and get the shared scratch/putvalue MRs).
+		 * c % num_rails, so its data, PutValue, and sc endpoints open on
+		 * that rail's domain. effective_rails = min(nContexts, num_rails)
+		 * is how many rails get used (and get a shared scratch MR).
 		 */
 		auto &gin_ep = put_comm->get_resources().get_ep();
 		auto &domain = gin_ep.get_domain();
@@ -629,8 +506,8 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		/*
 		 * Step 2: Per-rail GDA ops table and fi_info, indexed by rail
 		 * id. Open FI_EFA_GDA_OPS on each used rail's domain (used by
-		 * data EPs to bind the FI_WRITE counter, data.populate(), and
-		 * sc EPs).
+		 * the data and PutValue EPs to bind FI_WRITE counters and by
+		 * every endpoint's populate path).
 		 */
 		struct fi_efa_ops_gda *gda_ops_rail[NCCL_OFI_GDAKI_MAX_RAILS] = {};
 		struct fi_info *proxy_info_rail[NCCL_OFI_GDAKI_MAX_RAILS] = {};
@@ -681,12 +558,12 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		}
 
 		/* Pre-size all per-ctx vectors and the contiguous dev_handles[]
-		 * GPU array. data / d_counter_handles / d_signal_handles hold
-		 * unique_ptrs whose targets are constructed inside the per-ctx
-		 * loop below; sc_endpoints holds vectors-of-unique_ptr too.
-		 * Resizing here just creates the slots (default-initialized
-		 * empty unique_ptrs); endpoints / GPU buffers are allocated
-		 * later only after we successfully open them. */
+		 * GPU array. data / pvdata / d_counter_handles /
+		 * d_signal_handles hold unique_ptrs whose targets are constructed
+		 * inside the per-ctx loop below; sc_endpoints holds
+		 * vectors-of-unique_ptr too. Resizing here just creates the slots
+		 * (default-initialized empty unique_ptrs); endpoints / GPU buffers
+		 * are allocated later only after we successfully open them. */
 		ctx->data.resize(nContexts);
 		for (int ctx_id = 0; ctx_id < nContexts; ctx_id++)
 			ctx->data[ctx_id] = std::make_unique<gdaki_data_endpoint>();
@@ -720,10 +597,9 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		exchange_signal_counter_counts(ctx.get(), put_comm, nranks, rank);
 
 		/*
-		 * Per-context loop: build (data EP + sc EPs + counter/signal
-		 * handle arrays) for each logical context. The dev_handles[]
-		 * slots are filled in a second loop below, after the PutValue
-		 * pool is allocated and slice bases are assigned.
+		 * Per-context loop: build the data EP, dedicated PutValue EP, sc
+		 * EPs, counter/signal handle arrays, and device-handle entry for
+		 * each logical context.
 		 *
 		 * local_n_sc  = this rank's sc-endpoint count.
 		 * global_n_sc = max over ranks; every rank must run this many
@@ -751,11 +627,12 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			struct fi_efa_ops_gda *gda_ops = gda_ops_rail[rail_id];
 
 			/*
-			 * Step 4: Open this ctx's endpoints — data EP (slot 0) and
-			 * this rank's local sc EPs (slots 1..local_n_sc). Surplus sc
-			 * slots have no local endpoint. All open on this ctx's rail
-			 * domain (ofi_domain / proxy_info / gda_ops selected above by
-			 * rail_id = ctx_id % num_rails).
+			 * Step 4: Open this ctx's endpoints: the data EP, dedicated
+			 * PutValue poster EP, and this rank's local sc EPs. Only the
+			 * data EP (target slot 0) and sc EPs (target slots
+			 * 1..local_n_sc) are remote targets; pvdata is poster-only.
+			 * Surplus sc slots have no local endpoint. All endpoints open
+			 * on this ctx's rail domain.
 			 */
 			/* The data endpoint issues both Put and Get, so it counts reads too. */
 			ctx->data[ctx_id]->open(ofi_domain, proxy_info, gda_ops,
@@ -796,20 +673,21 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 				eps, put_comm, nranks, rank, ep_addr_len);
 
 			/*
-			 * Step 6: Target addressing. Every poster endpoint
-			 * (the data EP and all local sc EPs — any may post a
-			 * Put/PutValue) builds one [total_slots * nranks] table that
-			 * resolves, through its OWN AV, every peer endpoint slot:
+			 * Step 6: Target addressing. Every poster endpoint (data,
+			 * pvdata, and all local sc EPs) builds one
+			 * [total_slots * nranks] table that resolves, through its OWN
+			 * AV, every peer endpoint slot:
 			 *     slot 0       -> peer's data EP (plain put / counter-only
 			 *                     "quiet sink" target — no FI_REMOTE_WRITE)
 			 *     slot 1 + s   -> peer's sc EP s (signal id s target,
 			 *                     whose FI_REMOTE_WRITE the GIN waitSignal
 			 *                     observes)
-			 * The device side selects the slot per write: 0 for a plain
-			 * or counter-only put, 1+signalId for a signalling put. A
-			 * (slot, peer) a peer doesn't expose (asymmetric counts) is a
-			 * zero address, skipped by populate(); a correct caller never
-			 * directs a signalId at a peer that did not create it.
+			 * Data/sc endpoints post Put; pvdata posts PutValue. The
+			 * device side selects slot 0 for a plain or counter-only
+			 * write and 1+signalId for a signalling write. A (slot, peer)
+			 * a peer doesn't expose (asymmetric counts) is a zero address,
+			 * skipped by populate(); a correct caller never directs a
+			 * signalId at a peer that did not create it.
 			 *
 			 * populate() consumes the peer-major all_addrs buffer
 			 * directly (addr(peer, slot) = all_addrs[(peer*total_slots +
@@ -848,6 +726,12 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 				[&](int i) { return ctx->sc_endpoints[ctx_id][i]->counter_dev_handle.dev; });
 			build_handle_array(*ctx->d_signal_handles[ctx_id], config->nSignals,
 				[&](int i) { return ctx->sc_endpoints[ctx_id][i]->signal_dev_handle.dev; });
+
+			/* All resources referenced by this context's device handle are
+			 * now populated. Fill its host-side entry; the complete array is
+			 * committed once after the loop. */
+			populate_dev_handle(ctx->dev_handles.host[ctx_id], ctx.get(),
+					    ctx_id, nranks, rank);
 		}
 
 		NCCL_OFI_INFO(NCCL_NET,
@@ -855,33 +739,11 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			      ctx->backend_version, ctx->data[0]->base.sq_size,
 			      ctx->data[0]->base.sq_entry_size);
 
-		/*
-		 * Step 7: PutValue source slot pool. Must run after every
-		 * context's data and sc endpoints are populated so their
-		 * sq_sizes are finalized. Allocates the shared GPU-VMM pool
-		 * and assigns each endpoint's slice base (the sc endpoints
-		 * commit their counter/signal dev handles inline; the data
-		 * endpoint's slice base is stashed for populate_dev_handle).
-		 */
-		setup_putvalue_pool(ctx.get(), put_comm);
-
-		/*
-		 * Step 8: Fill every context's slot in dev_handles[]. Done in
-		 * a second pass because populate_dev_handle reads the data
-		 * endpoint's putvalue_slice_base, which setup_putvalue_pool
-		 * only assigns once all sq_sizes are known. Don't commit per
-		 * entry — the whole array is committed once below.
-		 */
-		for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
-			populate_dev_handle(ctx->dev_handles.host[ctx_id], ctx.get(),
-					    ctx_id, nranks, rank);
-		}
-
-		/* Commit the whole dev_handles[] array (host → GPU) once. */
+		/* Step 7: Commit the whole dev_handles[] array (host -> GPU) once. */
 		ctx->dev_handles.commit();
 
 		/*
-		 * Step 9: Publish the host-side ncclNetDeviceHandle_v11_t.
+		 * Step 8: Publish the host-side ncclNetDeviceHandle_v11_t.
 		 * The kernel indexes dev_handles[ctx.contextId] to pick the
 		 * per-ctx state. .size is the size of one entry, per the
 		 * NCCL GIN device-handle contract.

@@ -448,8 +448,9 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 	gpu_qp.build(backend_version, sq_attr, rq_attr, sq_buffer.dev, sq_doorbell.dev);
 
 	/* Stash SQ ring depth for the device-side SQ-overflow backpressure
-	 * check. Both gdaki_data_endpoint and gdaki_sc_endpoint read this
-	 * via base.sq_size. entry_size is kept for createContext's log line. */
+	 * check. The data and pvdata gdaki_data_endpoint instances, plus each
+	 * gdaki_sc_endpoint, read this via base.sq_size. entry_size is kept for
+	 * createContext's log line. */
 	sq_size = sq_attr.num_entries;
 	sq_entry_size = sq_attr.entry_size;
 
@@ -543,6 +544,8 @@ void gdaki_sc_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda
 		h.base.sq_lock = 0;
 		h.base.submitted_count = 0;
 		h.base.sq_size = base.sq_size;
+		h.base.putvalue_pad = 0;
+		h.base.putvalue_slice_base = 0;
 		h.cntr_offset = 0;   /* offset-based reset baseline */
 	};
 

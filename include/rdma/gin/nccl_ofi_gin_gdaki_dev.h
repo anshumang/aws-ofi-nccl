@@ -24,16 +24,12 @@
 #ifndef NCCL_OFI_GIN_GDAKI_DEV_H_
 #define NCCL_OFI_GIN_GDAKI_DEV_H_
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* Per-slot stride (bytes) of the PutValue source pool. PutValue's T
- * is asserted by the kernel template to be <= 8 bytes; using 8 lets
- * any T fit in one slot regardless of alignment. */
-#define NCCL_OFI_GDAKI_PUTVALUE_SLOT_SIZE 8
 
 /**
  * Per-peer MR metadata used by EFA GDA WQE construction.
@@ -122,13 +118,14 @@ struct nccl_ofi_gin_gdaki_dev_cq;
 
 
 /**
- * Common per-endpoint state shared by the data, counter, and signal
- * device handles. Holds the GPU-resident QP/CQ, the target
+ * Common per-endpoint state shared by the data, PutValue, counter, and
+ * signal device handles. Holds the GPU-resident QP/CQ, the target
  * addressing table, the per-QP spinlock that serializes the
  * device-side WQE-post sequence, and the counter-based completion
  * tracking fields.
- * Used directly as the `data` member of nccl_ofi_gin_gdaki_dev_handle,
- * and embedded as a `base` member in nccl_ofi_gin_gdaki_dev_counter_handle.
+ * Used directly as the `data` and `pvdata` members of
+ * nccl_ofi_gin_gdaki_dev_handle, and embedded as a `base` member in
+ * nccl_ofi_gin_gdaki_dev_counter_handle.
  *
  * Layout is shared with the NCCL mirror in
  * nccl_device/gin/efa_gda/gin_efa_gda_dev.h — keep them in sync.
@@ -155,15 +152,16 @@ struct nccl_ofi_gin_gdaki_dev_endpoint_handle {
 	 *       FI_WRITE counter without firing a signal on the receiver)
 	 *     signalling write (signal id s) -> slot 1 + s (peer sc EP s,
 	 *       whose FI_REMOTE_WRITE counter the GIN waitSignal observes)
-	 * The local poster QP is chosen by counterId (which endpoint owns
-	 * this handle); the remote target QP is chosen by the slot.
+	 * For Put, the local poster QP is chosen by counterId (which endpoint
+	 * owns this handle); PutValue uses the dedicated pvdata QP. The remote
+	 * target QP is chosen by the slot.
 	 *
 	 * Every (slot, peer) tuple is resolved through THIS endpoint's own
-	 * AV (an address handle is AV-local), so the data endpoint and every
-	 * sc endpoint each carry their own table. A (slot, peer) a peer does
-	 * not expose (asymmetric counts) is a zero entry, never addressed (a
-	 * correct caller never directs a signalId at a peer that did not
-	 * create it).
+	 * AV (an address handle is AV-local), so the data endpoint, pvdata
+	 * endpoint, and every sc endpoint each carry their own table. A
+	 * (slot, peer) a peer does not expose (asymmetric counts) is a zero
+	 * entry, never addressed (a correct caller never directs a signalId
+	 * at a peer that did not create it).
 	 *
 	 * Layout is shared with the NCCL mirror in
 	 * nccl_device/gin/efa_gda/gin_efa_gda_dev.h — keep them in sync. */
@@ -192,23 +190,23 @@ struct nccl_ofi_gin_gdaki_dev_endpoint_handle {
 	 * check and by Flush to wait for local completion.
 	 *
 	 * `local_cntr_value` is NULL when the endpoint has no hardware counter
-	 * bound. In that case the device-side Put / Flush silently skip the
-	 * counter operations on this endpoint. */
+	 * bound. In that case the device-side Put / PutValue / Flush silently
+	 * skip the counter operations on this endpoint. */
 	volatile uint64_t *local_cntr_value;
 	uint64_t submitted_count;
 
-	/* SQ ring size for this endpoint's QP. Used by the device-side Put
-	 * to gate new batches against in-flight WRs (efa-dp-direct's
-	 * start_sq_batch does not validate ring overflow on its own). The
-	 * kernel spins until (submitted_count - *local_cntr_value + batch_size)
-	 * <= sq_size before reserving slots. */
+	/* SQ ring size for this endpoint's QP. Used by the device-side Put and
+	 * PutValue paths to gate new batches against in-flight WRs
+	 * (efa-dp-direct's start_sq_batch does not validate ring overflow on
+	 * its own). The kernel spins until
+	 * (submitted_count - *local_cntr_value + batch_size) <= sq_size before
+	 * reserving slots. */
 	uint32_t sq_size;
 
+	/* Backend-version-1 PutValue staging fields. Backend version 2 writes
+	 * the payload inline and leaves these fields zero, but they remain in
+	 * the common handle to preserve the v1 ABI. */
 	uint32_t putvalue_pad;
-
-	/* Base of the PutValue source-slot pool; used only by the dedicated
-	 * PutValue endpoint (dev_handle.pvdata). Holds sq_size slots; the device
-	 * stages into slot (SQ_reservation_index % sq_size) * putvalue_slot_size. */
 	uint64_t putvalue_slice_base;
 };
 
@@ -294,12 +292,11 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 
 	/* Multi-rail: the rail (EFA NIC) this logical context is bound to.
 	 * The plugin opens this context's endpoints on rail rail_id's
-	 * domain and bakes that rail's scratch / putvalue lkeys (and the
-	 * peers' per-rail rkeys) into this handle. The kernel uses rail_id
-	 * only to index the per-rail mr_handle array regMrSym returns as
-	 * the window; every endpoint / scratch / putvalue field here is
-	 * already rail-resolved. rail_id = contextId % num_rails. Mirror
-	 * of the NCCL-side field. */
+	 * domain and bakes that rail's scratch lkey (and the peers' per-rail
+	 * rkeys) into this handle. The kernel uses rail_id only to index the
+	 * per-rail mr_handle array regMrSym returns as the window; every
+	 * endpoint and scratch field here is already rail-resolved.
+	 * rail_id = contextId % num_rails. Mirror of the NCCL-side field. */
 	uint32_t rail_id;
 
 	/* Signal-only scratch buffer support.
@@ -328,18 +325,64 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 	/* Per-peer remote scratch rkeys, indexed by rank. [nranks] in GPU mem. */
 	uint32_t *scratch_remote_rkeys;
 
-	/* PutValue source slot pool for the dedicated pvdata endpoint. PutValue
-	 * stages srcVal through a registered local slot, then RDMA-writes it to
-	 * the user's destination; the write arrives on the peer's target endpoint
-	 * chosen by the signal (sc EP for a signalled PutValue, data EP for
-	 * no-signal), bumping FI_REMOTE_WRITE where applicable.
-	 *
-	 * The pool holds pvdata.sq_size slots. Slot stride is uniform
-	 * (== NCCL_OFI_GDAKI_PUTVALUE_SLOT_SIZE, the max sizeof(T) PutValue
-	 * accepts); pool base lives on pvdata.putvalue_slice_base. */
+	/* Backend-version-1 PutValue staging MR metadata. Backend version 2
+	 * leaves these fields zero; retaining them preserves the v1 ABI. */
 	uint32_t putvalue_lkey;
 	uint32_t putvalue_slot_size;
 };
+
+/*
+ * The device handle is a binary contract with independently compiled NCCL
+ * kernels. Keep these values synchronized with NCCL's
+ * nccl_device/gin/efa_gda/gin_efa_gda_dev.h mirror.
+ */
+#if defined(__cplusplus)
+#define NCCL_OFI_GDAKI_ABI_ASSERT(condition, message) static_assert(condition, message)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define NCCL_OFI_GDAKI_ABI_ASSERT(condition, message) _Static_assert(condition, message)
+#else
+#define NCCL_OFI_GDAKI_ABI_ASSERT(condition, message)
+#endif
+
+NCCL_OFI_GDAKI_ABI_ASSERT(sizeof(void *) == 8,
+			  "GDAKI device-handle ABI requires 64-bit pointers");
+
+NCCL_OFI_GDAKI_ABI_ASSERT(sizeof(struct nccl_ofi_gin_gdaki_dev_endpoint_handle) == 80,
+			  "GDAKI endpoint handle ABI size changed");
+NCCL_OFI_GDAKI_ABI_ASSERT(
+	offsetof(struct nccl_ofi_gin_gdaki_dev_endpoint_handle, putvalue_pad) == 68,
+	"GDAKI endpoint putvalue_pad ABI offset changed");
+NCCL_OFI_GDAKI_ABI_ASSERT(
+	offsetof(struct nccl_ofi_gin_gdaki_dev_endpoint_handle, putvalue_slice_base) == 72,
+	"GDAKI endpoint putvalue_slice_base ABI offset changed");
+
+NCCL_OFI_GDAKI_ABI_ASSERT(sizeof(struct nccl_ofi_gin_gdaki_dev_counter_handle) == 96,
+			  "GDAKI counter handle ABI size changed");
+NCCL_OFI_GDAKI_ABI_ASSERT(
+	offsetof(struct nccl_ofi_gin_gdaki_dev_counter_handle, cntr_value) == 80,
+	"GDAKI counter cntr_value ABI offset changed");
+NCCL_OFI_GDAKI_ABI_ASSERT(
+	offsetof(struct nccl_ofi_gin_gdaki_dev_counter_handle, cntr_offset) == 88,
+	"GDAKI counter cntr_offset ABI offset changed");
+
+NCCL_OFI_GDAKI_ABI_ASSERT(sizeof(struct nccl_ofi_gin_gdaki_dev_handle) == 240,
+			  "GDAKI device handle ABI size changed");
+NCCL_OFI_GDAKI_ABI_ASSERT(offsetof(struct nccl_ofi_gin_gdaki_dev_handle, pvdata) == 80,
+			  "GDAKI device pvdata ABI offset changed");
+NCCL_OFI_GDAKI_ABI_ASSERT(
+	offsetof(struct nccl_ofi_gin_gdaki_dev_handle, counter_handles) == 160,
+	"GDAKI device counter_handles ABI offset changed");
+NCCL_OFI_GDAKI_ABI_ASSERT(
+	offsetof(struct nccl_ofi_gin_gdaki_dev_handle, scratch_local_addr) == 208,
+	"GDAKI device scratch_local_addr ABI offset changed");
+NCCL_OFI_GDAKI_ABI_ASSERT(
+	offsetof(struct nccl_ofi_gin_gdaki_dev_handle, putvalue_lkey) == 232,
+	"GDAKI device putvalue_lkey ABI offset changed");
+NCCL_OFI_GDAKI_ABI_ASSERT(
+	offsetof(struct nccl_ofi_gin_gdaki_dev_handle, putvalue_slot_size) == 236,
+	"GDAKI device putvalue_slot_size ABI offset changed");
+
+#undef NCCL_OFI_GDAKI_ABI_ASSERT
 
 #ifdef __cplusplus
 }
