@@ -42,7 +42,7 @@ bin_PROGRAMS = nccl_connection nccl_message_transfer ring inflight_close reuse_l
 EXTRA_PROGRAMS = rma_multiseg_signal
 if HAVE_GDAKI
 if HAVE_NVCC
-bin_PROGRAMS += gin_put_gdaki_gpu gin_signal_gdaki_gpu
+bin_PROGRAMS += gin_put_gdaki_gpu gin_putvalue_gdaki_gpu gin_signal_gdaki_gpu
 endif
 endif
 
@@ -60,7 +60,7 @@ grouped_recv_SOURCES = $(base_sources) grouped_recv.cpp
 gin_gdaki_misconfig_probe_SOURCES = $(base_sources) gin_gdaki_misconfig_probe.cpp
 gin_gdaki_backend_version_SOURCES = $(base_sources) gin_gdaki_backend_version.cpp
 
-# GDAKI GPU smoke test. .cu compiles via the .cu.o suffix rule below,
+# GDAKI GPU tests. .cu compiles via the .cu.o suffix rule below,
 # .cpp via the existing CXXCOMPILE; the binary links via CXXLINK
 # (libtool / mpicxx), same as every other test, with -lcuda added.
 # nvcc -c (not -dc) fully resolves device code in the object file, so
@@ -72,6 +72,9 @@ SUFFIXES = .cu
 
 gin_put_gdaki_gpu_SOURCES = $(base_sources) gin_put_gdaki_gpu.cu
 gin_put_gdaki_gpu_LDADD = $(LDADD) -lcuda
+
+gin_putvalue_gdaki_gpu_SOURCES = $(base_sources) gin_putvalue_gdaki_gpu.cu
+gin_putvalue_gdaki_gpu_LDADD = $(LDADD) -lcuda
 
 gin_signal_gdaki_gpu_SOURCES = $(base_sources) gin_signal_gdaki_gpu.cu
 gin_signal_gdaki_gpu_LDADD = $(LDADD) -lcuda
