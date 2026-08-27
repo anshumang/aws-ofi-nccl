@@ -621,6 +621,57 @@ public:
 };
 
 /**
+ * Backend-version-1 PutValue source staging.
+ *
+ * Backend version 1 cannot carry RDMA-write payload inline, so each logical
+ * context receives a slice of one shared GPU VMM allocation. The allocation
+ * is exported as a DMA-BUF and registered on every active rail. This owner
+ * keeps the allocation, fd, per-rail MRs/lkeys, and per-context slice bases
+ * together so backend version 2 does not carry staging-resource state.
+ *
+ * setup() may throw after acquiring some resources. Its failure path releases
+ * everything acquired so far, leaving the object safe to destroy.
+ */
+class gdaki_putvalue_v1_staging {
+public:
+	gdaki_putvalue_v1_staging() = default;
+	~gdaki_putvalue_v1_staging();
+
+	gdaki_putvalue_v1_staging(const gdaki_putvalue_v1_staging &) = delete;
+	gdaki_putvalue_v1_staging &operator=(const gdaki_putvalue_v1_staging &) = delete;
+	gdaki_putvalue_v1_staging(gdaki_putvalue_v1_staging &&) = delete;
+	gdaki_putvalue_v1_staging &operator=(gdaki_putvalue_v1_staging &&) = delete;
+
+	/**
+	 * Allocate and register staging for one slice per SQ depth in
+	 * context_sq_sizes. rail_domains contains the active rails.
+	 */
+	void setup(const std::vector<uint32_t> &context_sq_sizes,
+		   const std::vector<struct fid_domain *> &rail_domains);
+
+	uint32_t lkey_for_rail(uint16_t rail_id) const;
+	uint64_t slice_base_for_context(size_t context_id) const;
+	size_t pool_size() const { return pool_bytes; }
+	uint32_t slot_size() const { return slot_size_bytes; }
+	bool initialized() const { return pool != nullptr; }
+
+private:
+	struct rail_registration {
+		struct fid_mr *mr = nullptr;
+		uint32_t lkey = 0;
+	};
+
+	void release() noexcept;
+
+	void *pool = nullptr;
+	int dmabuf_fd = -1;
+	size_t pool_bytes = 0;
+	uint32_t slot_size_bytes = sizeof(uint64_t);
+	std::array<rail_registration, NCCL_OFI_GDAKI_MAX_RAILS> rail_registrations;
+	std::vector<uint64_t> context_slice_bases;
+};
+
+/**
  * Per-rail registration and addressing metadata for the context's shared
  * signal-only scratch buffer. The buffer is used as both the local source
  * and remote target of signal-only writes.
@@ -750,6 +801,10 @@ struct nccl_ofi_gin_gdaki_context {
 	 * to pick its entry. Each host entry is populated after that context's
 	 * endpoints are built; the complete array is committed once. */
 	gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_handle> dev_handles;
+
+	/* Present only for backend version 1. The owner keeps all PutValue
+	 * staging resources out of the common endpoint and per-rail owners. */
+	std::unique_ptr<gdaki_putvalue_v1_staging> putvalue_v1_staging;
 
 	/* Per-rail registration and addressing metadata for the shared scratch
 	 * buffer. Indexed by rail id; only [0, effective_rails) are populated. */

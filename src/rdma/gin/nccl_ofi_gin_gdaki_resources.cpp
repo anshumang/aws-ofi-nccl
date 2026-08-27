@@ -15,6 +15,9 @@
 #include "efa_cuda_dp_v1.h"
 #include "efa_cuda_dp_v2.h"
 
+#include <errno.h>
+#include <limits>
+
 #include <rdma/fi_cm.h>
 #include <rdma/fi_ext_efa.h>
 
@@ -490,6 +493,181 @@ void gdaki_data_endpoint::populate(int backend_version, struct fi_efa_ops_gda *g
 	/* Delegate the shared work (QP/CQ query, MMIO map, GPU descriptors,
 	 * target table, sq_size stash) to the inner endpoint. */
 	base.populate(backend_version, gda_ops, all_addrs, ep_addr_len, total_slots, nranks);
+}
+
+gdaki_putvalue_v1_staging::~gdaki_putvalue_v1_staging()
+{
+	release();
+}
+
+void gdaki_putvalue_v1_staging::release() noexcept
+{
+	for (auto &registration : rail_registrations) {
+		if (registration.mr != nullptr) {
+			fi_close(&registration.mr->fid);
+			registration.mr = nullptr;
+		}
+		registration.lkey = 0;
+	}
+
+	if (dmabuf_fd >= 0) {
+		close(dmabuf_fd);
+		dmabuf_fd = -1;
+	}
+
+	if (pool != nullptr) {
+		nccl_net_ofi_gpu_vmm_free(pool, pool_bytes);
+		pool = nullptr;
+	}
+	pool_bytes = 0;
+	context_slice_bases.clear();
+}
+
+void gdaki_putvalue_v1_staging::setup(
+	const std::vector<uint32_t> &context_sq_sizes,
+	const std::vector<struct fid_domain *> &rail_domains)
+{
+	if (initialized() || dmabuf_fd >= 0 || !context_slice_bases.empty()) {
+		throw std::runtime_error(
+			"gdaki_putvalue_v1_staging: setup called more than once");
+	}
+	if (context_sq_sizes.empty()) {
+		throw std::runtime_error(
+			"gdaki_putvalue_v1_staging: no logical contexts");
+	}
+	if (rail_domains.empty() ||
+	    rail_domains.size() > rail_registrations.size()) {
+		throw std::runtime_error(
+			"gdaki_putvalue_v1_staging: invalid active rail count");
+	}
+	for (size_t rail_id = 0; rail_id < rail_domains.size(); rail_id++) {
+		if (rail_domains[rail_id] == nullptr) {
+			throw std::runtime_error(
+				"gdaki_putvalue_v1_staging: rail " +
+				std::to_string(rail_id) + " domain is null");
+		}
+	}
+
+	uint64_t total_slots = 0;
+	for (size_t context_id = 0; context_id < context_sq_sizes.size();
+	     context_id++) {
+		const uint32_t sq_size = context_sq_sizes[context_id];
+		if (sq_size == 0) {
+			throw std::runtime_error(
+				"gdaki_putvalue_v1_staging: context " +
+				std::to_string(context_id) + " SQ size is zero");
+		}
+		if (sq_size > std::numeric_limits<uint64_t>::max() - total_slots) {
+			throw std::runtime_error(
+				"gdaki_putvalue_v1_staging: slot count overflow");
+		}
+		total_slots += sq_size;
+	}
+	if (total_slots >
+	    std::numeric_limits<size_t>::max() / slot_size_bytes) {
+		throw std::runtime_error(
+			"gdaki_putvalue_v1_staging: pool size overflow");
+	}
+	const size_t requested_bytes =
+		static_cast<size_t>(total_slots) * slot_size_bytes;
+
+	try {
+		context_slice_bases.resize(context_sq_sizes.size());
+
+		void *gpu_pool = nullptr;
+		size_t actual_size = 0;
+		int ret = nccl_net_ofi_gpu_vmm_alloc(
+			&gpu_pool, requested_bytes, &actual_size);
+		pool = gpu_pool;
+		pool_bytes = actual_size;
+		if (ret != 0) {
+			throw std::runtime_error(
+				"gdaki_putvalue_v1_staging: gpu_vmm_alloc failed");
+		}
+		if (pool == nullptr || pool_bytes < requested_bytes) {
+			throw std::runtime_error(
+				"gdaki_putvalue_v1_staging: invalid VMM allocation");
+		}
+
+		size_t fd_offset = 0;
+		if (nccl_net_ofi_gpu_get_dma_buf_fd(
+			    pool, pool_bytes, &dmabuf_fd, &fd_offset) != 0) {
+			throw std::runtime_error(
+				"gdaki_putvalue_v1_staging: get_dma_buf_fd failed");
+		}
+
+		int cuda_device = 0;
+		if (nccl_net_ofi_get_gpu_device_for_addr(
+			    pool, &cuda_device) != 0) {
+			throw std::runtime_error(
+				"gdaki_putvalue_v1_staging: "
+				"get_gpu_device_for_addr failed");
+		}
+
+		struct fi_mr_dmabuf dmabuf = {};
+		dmabuf.fd = dmabuf_fd;
+		dmabuf.offset = fd_offset;
+		dmabuf.len = pool_bytes;
+		dmabuf.base_addr = pool;
+
+		struct fi_mr_attr mr_attr = {};
+		mr_attr.dmabuf = &dmabuf;
+		mr_attr.iov_count = 1;
+		mr_attr.access = FI_WRITE;
+		mr_attr.iface = FI_HMEM_CUDA;
+		mr_attr.device.cuda = cuda_device;
+		mr_attr.requested_key = 0;
+
+		for (size_t rail_id = 0; rail_id < rail_domains.size();
+		     rail_id++) {
+			auto &registration = rail_registrations[rail_id];
+			ret = fi_mr_regattr(
+				rail_domains[rail_id], &mr_attr, FI_MR_DMABUF,
+				&registration.mr);
+			if (ret != 0) {
+				throw std::runtime_error(
+					"gdaki_putvalue_v1_staging: "
+					"fi_mr_regattr on rail " +
+					std::to_string(rail_id) + " failed: " +
+					std::string(fi_strerror(-ret)));
+			}
+			registration.lkey =
+				static_cast<uint32_t>(fi_mr_key(registration.mr));
+		}
+
+		uint64_t cursor =
+			static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pool));
+		for (size_t context_id = 0;
+		     context_id < context_sq_sizes.size(); context_id++) {
+			context_slice_bases[context_id] = cursor;
+			cursor +=
+				static_cast<uint64_t>(context_sq_sizes[context_id]) *
+				slot_size_bytes;
+		}
+	} catch (...) {
+		release();
+		throw;
+	}
+}
+
+uint32_t gdaki_putvalue_v1_staging::lkey_for_rail(uint16_t rail_id) const
+{
+	if (rail_id >= rail_registrations.size() ||
+	    rail_registrations[rail_id].mr == nullptr) {
+		throw std::runtime_error(
+			"gdaki_putvalue_v1_staging: rail is not registered");
+	}
+	return rail_registrations[rail_id].lkey;
+}
+
+uint64_t gdaki_putvalue_v1_staging::slice_base_for_context(
+	size_t context_id) const
+{
+	if (context_id >= context_slice_bases.size()) {
+		throw std::runtime_error(
+			"gdaki_putvalue_v1_staging: context has no slice");
+	}
+	return context_slice_bases[context_id];
 }
 
 void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
