@@ -312,6 +312,35 @@ static void setup_scratch_buffer(nccl_ofi_gin_gdaki_context *ctx,
 }
 
 /*
+ * Allocate backend-version-1 PutValue staging after every dedicated pvdata
+ * endpoint has been populated and its SQ size is known. One shared GPU VMM
+ * pool is sliced by logical context and registered on every active rail.
+ *
+ * Backend version 2 does not call this helper because it carries PutValue
+ * payloads inline in the WQE.
+ */
+static void setup_putvalue_v1_staging(nccl_ofi_gin_gdaki_context *ctx,
+				      nccl_ofi_rdma_gin_put_comm *put_comm)
+{
+	std::vector<uint32_t> pvdata_sq_sizes;
+	pvdata_sq_sizes.reserve(ctx->nContexts);
+	for (int ctx_id = 0; ctx_id < ctx->nContexts; ctx_id++) {
+		pvdata_sq_sizes.push_back(ctx->pvdata[ctx_id]->base.sq_size);
+	}
+
+	auto &domain = put_comm->get_resources().get_ep().get_domain();
+	std::vector<struct fid_domain *> rail_domains;
+	rail_domains.reserve(ctx->effective_rails);
+	for (uint16_t rail_id = 0; rail_id < ctx->effective_rails; rail_id++) {
+		rail_domains.push_back(domain.get_ofi_domain(rail_id).get());
+	}
+
+	auto staging = std::make_unique<gdaki_putvalue_v1_staging>();
+	staging->setup(pvdata_sq_sizes, rail_domains);
+	ctx->putvalue_v1_staging = std::move(staging);
+}
+
+/*
  * Fill one entry of the contiguous dev_handles[] GPU array for logical
  * context `ctx_id`. Caller (createContext) owns the GPU buffer; this
  * function only writes the host-side copy. The whole array is committed
@@ -322,6 +351,12 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle &h,
 				int ctx_id,
 				int nranks, int rank)
 {
+	const auto *putvalue_staging = ctx->putvalue_v1_staging.get();
+	if ((ctx->backend_version == 1) != (putvalue_staging != nullptr)) {
+		throw std::runtime_error(
+			"gin GDAKI: backend version and PutValue staging disagree");
+	}
+
 	h.data.qp = ctx->data[ctx_id]->base.gpu_qp.dev();
 	h.data.cq = ctx->data[ctx_id]->base.gpu_cq.dev();
 	h.data.target_address_handles = ctx->data[ctx_id]->base.targets.ahs.dev;
@@ -369,10 +404,16 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle &h,
 	h.scratch_remote_addrs = rs.scratch_remote_addrs_buf.dev;
 	h.scratch_remote_rkeys = rs.scratch_remote_rkeys_buf.dev;
 
-	/* Backend version 1 setup will populate these staging fields before the
-	 * device-handle array is committed. Backend version 2 leaves them zero. */
+	/* The staging pool serves only the dedicated pvdata endpoint. Backend
+	 * version 2 has no pool, so all legacy staging fields remain zero. */
 	h.putvalue_lkey = 0;
 	h.putvalue_slot_size = 0;
+	if (putvalue_staging != nullptr) {
+		h.pvdata.putvalue_slice_base =
+			putvalue_staging->slice_base_for_context(ctx_id);
+		h.putvalue_lkey = putvalue_staging->lkey_for_rail(rail_id);
+		h.putvalue_slot_size = putvalue_staging->slot_size();
+	}
 }
 
 /* `backend_version` must already be validated by the caller; see
@@ -598,8 +639,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 
 		/*
 		 * Per-context loop: build the data EP, dedicated PutValue EP, sc
-		 * EPs, counter/signal handle arrays, and device-handle entry for
-		 * each logical context.
+		 * EPs, and counter/signal handle arrays for each logical context.
 		 *
 		 * local_n_sc  = this rank's sc-endpoint count.
 		 * global_n_sc = max over ranks; every rank must run this many
@@ -726,12 +766,6 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 				[&](int i) { return ctx->sc_endpoints[ctx_id][i]->counter_dev_handle.dev; });
 			build_handle_array(*ctx->d_signal_handles[ctx_id], config->nSignals,
 				[&](int i) { return ctx->sc_endpoints[ctx_id][i]->signal_dev_handle.dev; });
-
-			/* All resources referenced by this context's device handle are
-			 * now populated. Fill its host-side entry; the complete array is
-			 * committed once after the loop. */
-			populate_dev_handle(ctx->dev_handles.host[ctx_id], ctx.get(),
-					    ctx_id, nranks, rank);
 		}
 
 		NCCL_OFI_INFO(NCCL_NET,
@@ -739,11 +773,28 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			      ctx->backend_version, ctx->data[0]->base.sq_size,
 			      ctx->data[0]->base.sq_entry_size);
 
-		/* Step 7: Commit the whole dev_handles[] array (host -> GPU) once. */
+		/*
+		 * Step 7: Backend-version-1 PutValue staging. Every pvdata SQ
+		 * size is now final, so allocate sum(pvdata[c].sq_size) slots
+		 * and register the shared pool on each active rail. Backend
+		 * version 2 carries the payload inline and skips this entirely.
+		 */
+		if (ctx->backend_version == 1) {
+			setup_putvalue_v1_staging(ctx.get(), put_comm);
+		}
+
+		/*
+		 * Step 8: Fill every device-handle entry after optional v1
+		 * staging setup, then commit the complete array once.
+		 */
+		for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
+			populate_dev_handle(ctx->dev_handles.host[ctx_id], ctx.get(),
+					    ctx_id, nranks, rank);
+		}
 		ctx->dev_handles.commit();
 
 		/*
-		 * Step 8: Publish the host-side ncclNetDeviceHandle_v11_t.
+		 * Step 9: Publish the host-side ncclNetDeviceHandle_v11_t.
 		 * The kernel indexes dev_handles[ctx.contextId] to pick the
 		 * per-ctx state. .size is the size of one entry, per the
 		 * NCCL GIN device-handle contract.
