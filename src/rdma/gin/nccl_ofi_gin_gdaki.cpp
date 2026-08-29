@@ -758,17 +758,20 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			 * rail_id = ctx_id % num_rails).
 			 */
 			/* The data endpoint issues both Put and Get, so it counts reads too. */
-			ctx->data[ctx_id]->open(ofi_domain, proxy_info, gda_ops, FI_WRITE | FI_READ);
+			ctx->data[ctx_id]->open(ofi_domain, proxy_info, gda_ops,
+						ctx->backend_version, FI_WRITE | FI_READ);
 			if (local_n_sc > 0) {
 				ctx->sc_endpoints[ctx_id].reserve(local_n_sc);
 			}
 			for (int i = 0; i < local_n_sc; i++) {
 				ctx->sc_endpoints[ctx_id].push_back(std::make_unique<gdaki_sc_endpoint>());
-				ctx->sc_endpoints[ctx_id][i]->open(ofi_domain, proxy_info, gda_ops);
+				ctx->sc_endpoints[ctx_id][i]->open(ofi_domain, proxy_info, gda_ops,
+								   ctx->backend_version);
 			}
 			/* Dedicated PutValue poster endpoint. */
 			/* PutValue only writes. */
-			ctx->pvdata[ctx_id]->open(ofi_domain, proxy_info, gda_ops, FI_WRITE);
+			ctx->pvdata[ctx_id]->open(ofi_domain, proxy_info, gda_ops,
+						  ctx->backend_version, FI_WRITE);
 
 			/*
 			 * Step 5: Exchange ALL of this ctx's endpoint addresses in a
@@ -846,6 +849,11 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			build_handle_array(*ctx->d_signal_handles[ctx_id], config->nSignals,
 				[&](int i) { return ctx->sc_endpoints[ctx_id][i]->signal_dev_handle.dev; });
 		}
+
+		NCCL_OFI_INFO(NCCL_NET,
+			      "gin GDAKI: backendVersion %d, SQ %u entries x %u bytes",
+			      ctx->backend_version, ctx->data[0]->base.sq_size,
+			      ctx->data[0]->base.sq_entry_size);
 
 		/*
 		 * Step 7: PutValue source slot pool. Must run after every

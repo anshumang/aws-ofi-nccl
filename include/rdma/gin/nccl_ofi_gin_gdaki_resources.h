@@ -194,9 +194,11 @@ public:
 	 * Open EP + CQ + AV on `domain`, bind CQ and AV.
 	 * Does NOT enable — caller must call enable() after any
 	 * additional binds (e.g. counters).
+	 *
+	 * Version 2 asks for the 128B WQE.
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  size_t cq_size);
+		  size_t cq_size, int backend_version);
 
 	/*
 	 * Enable the endpoint. Must be called after open() and
@@ -493,6 +495,7 @@ public:
 	gdaki_gpu_cq            gpu_cq;
 	gdaki_target_addressing targets;   /* [total_slots*nranks] target table */
 	uint32_t                sq_size = 0;       /* SQ ring depth, populated by populate() */
+	uint32_t                sq_entry_size = 0; /* SQ WQE bytes, populated by populate() */
 
 	gdaki_endpoint() = default;
 	/* Implicit dtor: members destroy in reverse declaration order. */
@@ -502,7 +505,8 @@ public:
 	/**
 	 * Open EP + CQ + AV on the proxy domain and enable.
 	 */
-	void open(struct fid_domain *domain, struct fi_info *ref_info, size_t cq_size);
+	void open(struct fid_domain *domain, struct fi_info *ref_info, size_t cq_size,
+		  int backend_version);
 
 	/**
 	 * Query EFA QP/CQ attributes, map the SQ MMIO regions for GPU
@@ -550,7 +554,8 @@ public:
 	 * that also issues reads.
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  struct fi_efa_ops_gda *gda_ops, uint64_t cntr_flags);
+		  struct fi_efa_ops_gda *gda_ops, int backend_version,
+		  uint64_t cntr_flags);
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors (QP/CQ attrs,
@@ -614,7 +619,7 @@ public:
 	 * counters, then enables.
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  struct fi_efa_ops_gda *gda_ops);
+		  struct fi_efa_ops_gda *gda_ops, int backend_version);
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors, build the

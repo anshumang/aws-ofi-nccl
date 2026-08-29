@@ -18,9 +18,15 @@
 #include <rdma/fi_cm.h>
 #include <rdma/fi_ext_efa.h>
 
-static constexpr uint32_t gdaki_narrow_wqe_size = 64;
-static constexpr uint32_t gdaki_wide_wqe_size = 128;
-static constexpr uint32_t gdaki_narrow_wqe_inline_size = 32;
+/*
+ * Inline-data capacity requested for a backendVersion-2 endpoint.
+ *
+ * A 64B EFA WQE holds at most 32B of inline data and has no inline region in
+ * its RDMA-write descriptor at all. Requesting more than 32B is what makes
+ * libfabric create the QP with EFADV_QP_FLAGS_INLINE_WRITE, which rdma-core
+ * turns into a 128B WQE.
+ */
+static constexpr size_t gdaki_wide_wqe_inject_size = 33;
 static constexpr uint32_t gdaki_wide_wqe_inline_size = 80;
 static constexpr uint32_t gdaki_max_rdma_sges = 2;
 
@@ -38,7 +44,8 @@ static constexpr uint32_t gdaki_max_rdma_sges = 2;
  * so FI_SOURCE is not requested. FI_HMEM is still needed because the endpoint
  * is used to access GPU memory. efa-direct requires FI_CONTEXT2 per fi_efa(7).
  */
-static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info)
+static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info,
+			    int backend_version)
 {
 	hints.caps = FI_MSG | FI_RMA | FI_HMEM;
 	hints.mode = FI_CONTEXT2;
@@ -53,6 +60,11 @@ static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info)
 	hints.domain_attr->control_progress = FI_PROGRESS_AUTO;
 	hints.domain_attr->data_progress = FI_PROGRESS_AUTO;
 
+	/* Ask for a 128B WQE on backendVersion 2 only. */
+	if (backend_version == 2) {
+		hints.tx_attr->inject_size = gdaki_wide_wqe_inject_size;
+	}
+
 	/* Narrow fi_getinfo to the provider / fabric / domain the proxy
 	 * already opened. Names are required to obtain exactly one result. */
 	hints.fabric_attr->prov_name = strdup(ref_info->fabric_attr->prov_name);
@@ -64,13 +76,13 @@ static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info)
  * Obtain a GDAKI-owned fi_info via fi_getinfo, narrowed to exactly the
  * fabric / domain the proxy reference points at.
  */
-static struct fi_info *get_gdaki_info(struct fi_info *ref_info)
+static struct fi_info *get_gdaki_info(struct fi_info *ref_info, int backend_version)
 {
 	struct fi_info *hints = fi_allocinfo();
 	if (hints == nullptr) {
 		throw std::runtime_error("fi_allocinfo for GDAKI hints failed");
 	}
-	get_gdaki_hints(*hints, ref_info);
+	get_gdaki_hints(*hints, ref_info, backend_version);
 
 	struct fi_info *results = nullptr;
 	int ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0ULL,
@@ -94,13 +106,13 @@ static struct fi_info *get_gdaki_info(struct fi_info *ref_info)
 }
 
 void gdaki_fi_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			     size_t cq_size)
+			     size_t cq_size, int backend_version)
 {
 	if (ep || cq || av || info) {
 		throw std::runtime_error("gdaki_fi_endpoint: double open");
 	}
 
-	info = get_gdaki_info(ref_info);
+	info = get_gdaki_info(ref_info, backend_version);
 
 	struct fi_cq_attr cq_attr = {};
 	cq_attr.format = FI_CQ_FORMAT_DATA;
@@ -185,7 +197,7 @@ void gdaki_gpu_qp::build(int backend_version_in,
 			 void *sq_buf_dev, void *sq_db_dev)
 {
 	/* Each create call allocates GPU memory; rebuilding would overwrite the
-	 * owned pointer and leak the previous descriptor. */
+	 * only owned pointer and leak the previous descriptor. */
 	if (qp != nullptr) {
 		throw std::runtime_error("gdaki_gpu_qp: double build");
 	}
@@ -210,14 +222,6 @@ void gdaki_gpu_qp::build(int backend_version_in,
 		break;
 	}
 	case 2: {
-		if (sq_attr.entry_size != gdaki_narrow_wqe_size &&
-		    sq_attr.entry_size != gdaki_wide_wqe_size) {
-			throw std::runtime_error(
-				"gdaki_gpu_qp: unsupported SQ WQE size " +
-				std::to_string(sq_attr.entry_size) +
-				" for backendVersion 2");
-		}
-
 		efa_cuda_qp_attrs_v2 attrs = {};
 		attrs.sq_buffer = static_cast<uint8_t *>(sq_buf_dev);
 		attrs.rq_buffer = static_cast<uint8_t *>(rq_attr.buffer);
@@ -228,9 +232,7 @@ void gdaki_gpu_qp::build(int backend_version_in,
 		attrs.sq_max_batch = sq_attr.max_batch;
 		attrs.rq_num_entries = rq_attr.num_entries;
 		attrs.rq_entry_size = rq_attr.entry_size;
-		attrs.sq_max_inline_data = sq_attr.entry_size == gdaki_wide_wqe_size
-			? gdaki_wide_wqe_inline_size
-			: gdaki_narrow_wqe_inline_size;
+		attrs.sq_max_inline_data = gdaki_wide_wqe_inline_size;
 		attrs.sq_max_rdma_sges = gdaki_max_rdma_sges;
 		attrs.sq_wq_caps = EFA_CUDA_WQ_CAPS_64_BIT_REQ_ID_V2;
 		attrs.rq_wq_caps = 0;
@@ -279,7 +281,7 @@ gdaki_gpu_cq::~gdaki_gpu_cq()
 void gdaki_gpu_cq::build(int backend_version_in, const struct fi_efa_cq_attr &cq_attr)
 {
 	/* Each create call allocates GPU memory; rebuilding would overwrite the
-	 * owned pointer and leak the previous descriptor. */
+	 * only owned pointer and leak the previous descriptor. */
 	if (cq != nullptr) {
 		throw std::runtime_error("gdaki_gpu_cq: double build");
 	}
@@ -410,9 +412,9 @@ void gdaki_target_addressing::populate(gdaki_fi_endpoint &endpoint,
 }
 
 void gdaki_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			  size_t cq_size)
+			  size_t cq_size, int backend_version)
 {
-	endpoint.open(domain, ref_info, cq_size);
+	endpoint.open(domain, ref_info, cq_size, backend_version);
 	endpoint.enable();
 }
 
@@ -427,6 +429,14 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 		throw std::runtime_error("gdaki_endpoint query_qp_wqs failed: " +
 					 std::string(fi_strerror(-ret)));
 
+	if (backend_version == 2 && sq_attr.entry_size != 128) {
+		throw std::runtime_error(
+			"gdaki_endpoint: backendVersion 2 requires a 128-byte SQ WQE "
+			"but this endpoint has " + std::to_string(sq_attr.entry_size) +
+			" bytes; the device or libfabric does not support inline "
+			"RDMA write (wide WQE)");
+	}
+
 	sq_buffer.map(sq_attr.buffer,
 		      (size_t)sq_attr.num_entries * sq_attr.entry_size);
 
@@ -439,8 +449,9 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 
 	/* Stash SQ ring depth for the device-side SQ-overflow backpressure
 	 * check. Both gdaki_data_endpoint and gdaki_sc_endpoint read this
-	 * via base.sq_size. */
+	 * via base.sq_size. entry_size is kept for createContext's log line. */
 	sq_size = sq_attr.num_entries;
+	sq_entry_size = sq_attr.entry_size;
 
 	/* Query CQ and build GPU descriptor. */
 	struct fi_efa_cq_attr efa_cq_attr = {};
@@ -456,14 +467,15 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 }
 
 void gdaki_data_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			       struct fi_efa_ops_gda *gda_ops, uint64_t cntr_flags)
+			       struct fi_efa_ops_gda *gda_ops, int backend_version,
+			       uint64_t cntr_flags)
 {
 	/* Create the counter first; it will be bound to the inner endpoint
 	 * between open() and enable(). */
 	local_cntr.create(gda_ops, domain);
 
 	/* Open the inner endpoint without enable. */
-	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size());
+	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size(), backend_version);
 
 	base.endpoint.bind(&local_cntr.get()->fid, cntr_flags);
 
@@ -480,7 +492,7 @@ void gdaki_data_endpoint::populate(int backend_version, struct fi_efa_ops_gda *g
 }
 
 void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			     struct fi_efa_ops_gda *gda_ops)
+			     struct fi_efa_ops_gda *gda_ops, int backend_version)
 {
 	/* Create hardware counters first; they will be bound to the inner
 	 * endpoint between open() and enable(). */
@@ -489,7 +501,7 @@ void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info
 
 	/* Open the inner endpoint without enable. Use the same CQ sizing as
 	 * the data endpoint so callers get consistent capacity per env config. */
-	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size());
+	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size(), backend_version);
 
 	/* Bind counters before enabling. */
 	base.endpoint.bind(&write_cntr.get()->fid, FI_WRITE);
