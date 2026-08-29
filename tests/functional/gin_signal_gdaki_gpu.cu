@@ -25,7 +25,6 @@
 #include "functional_test.h"
 #include "rdma/gin/nccl_ofi_gin_gdaki_dev.h"
 
-#include "efa_cuda_dp.cuh"
 #include "efa_cuda_dp_impl.cuh"
 
 struct proc_handle {
@@ -50,25 +49,25 @@ __global__ void gin_signal_gpu_kernel(nccl_ofi_gin_gdaki_dev_counter_handle *sig
 				      uint8_t *out_status,
 				      uint8_t *out_q_type,
 				      uint8_t *out_op_type,
-				      uint16_t *out_req_id,
 				      uint32_t *out_done)
 {
 	if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-	auto *qp = sig->base.qp;
-	auto *cq = sig->base.cq;
+	/* The vendored unversioned device API is the backend-v2 layout. */
+	auto *qp = reinterpret_cast<efa_cuda_qp *>(sig->base.qp);
+	auto *cq = reinterpret_cast<efa_cuda_cq *>(sig->base.cq);
 
-	efa_io_tx_wqe wr;
-	efa_cuda_init_rdma_write_wr(&wr, /*wr_id=*/0, dst_rkey, dst_addr);
-	efa_cuda_wr_set_sge(&wr, src_lkey, src_addr, bytes);
+	efa_io_tx_wqe_128 wr;
+	EfaCudaWrBuilder wr_builder(&qp->sq.wr_ctx, reinterpret_cast<uint8_t *>(&wr));
+	if (wr_builder.init_rdma_write(/*wr_id=*/0, dst_rkey, dst_addr) != 0) return;
+	if (wr_builder.set_sge(src_lkey, src_addr, bytes) != 0) return;
 	/* Target peer's signal endpoint 0. In the unified target table,
 	 * signal id s lives at slot (1 + s); this test uses signal 0, so
 	 * slot 1 -> target idx = 1*nranks + peer. (Slot 0 is the peer data EP.) */
 	const uint32_t targetIdx = (uint32_t)nranks + (uint32_t)peer;
-	efa_cuda_wr_set_remote(&wr,
-			       sig->base.target_address_handles[targetIdx],
-			       (uint32_t)sig->base.target_remote_qpns[targetIdx],
-			       sig->base.target_qkey[targetIdx]);
+	wr_builder.set_remote(sig->base.target_address_handles[targetIdx],
+			      (uint32_t)sig->base.target_remote_qpns[targetIdx],
+			      sig->base.target_qkey[targetIdx]);
 
 	efa_cuda_start_sq_batch(qp, 1);
 	efa_cuda_sq_batch_place_wr(qp, 0, &wr);
@@ -83,7 +82,6 @@ __global__ void gin_signal_gpu_kernel(nccl_ofi_gin_gdaki_dev_counter_handle *sig
 			/* q_type lives in bits [2:1] of cqe->flags. */
 			*out_q_type = (uint8_t)((cqe->flags >> 1) & 0x3);
 			*out_op_type = efa_cuda_wc_read_opcode(wc);
-			*out_req_id = efa_cuda_wc_read_req_id(wc);
 			efa_cuda_cq_pop(cq, 1);
 			*out_done = 1;
 			return;
@@ -153,7 +151,7 @@ int main(int argc, char *argv[])
 	ginConfig.nContexts = 1;
 	ginConfig.queueDepth = 64;
 	ginConfig.trafficClass = -1;
-	ginConfig.backendVersion = 1;
+	ginConfig.backendVersion = 2;
 
 
 	void *proxyCtx = nullptr;
@@ -245,6 +243,7 @@ int main(int argc, char *argv[])
 	MPI_Barrier(MPI_COMM_WORLD);
 
 	/* Rank 0: post a single RDMA write on the signal endpoint to rank 1. */
+	int local_pass = 1;
 	if (rank == 0) {
 		const int tgt = 1;
 		NCCL_OFI_INFO(NCCL_NET,
@@ -255,9 +254,7 @@ int main(int argc, char *argv[])
 			uint8_t  status;
 			uint8_t  q_type;
 			uint8_t  op_type;
-			uint8_t  pad0;
-			uint16_t req_id;
-			uint16_t pad1;
+			uint8_t pad0;
 			uint32_t done;
 		};
 		kernel_result *d_result = nullptr;
@@ -271,7 +268,7 @@ int main(int argc, char *argv[])
 			(uint32_t)SIG_BUF_SIZE,
 			/*max_iters=*/100000000,
 			&d_result->status, &d_result->q_type, &d_result->op_type,
-			&d_result->req_id, &d_result->done);
+			&d_result->done);
 		CUDACHECK(cudaDeviceSynchronize());
 
 		kernel_result h_result = {};
@@ -281,11 +278,20 @@ int main(int argc, char *argv[])
 
 		if (!h_result.done) {
 			NCCL_OFI_WARN("R0: signal CQ poll timeout");
+			local_pass = 0;
 		} else {
 			NCCL_OFI_INFO(NCCL_NET,
-				      "R0: signal CQ completion status=%u op_type=%u q_type=%u req_id=%u",
-				      h_result.status, h_result.op_type,
-				      h_result.q_type, h_result.req_id);
+				      "R0: signal CQ completion status=%u op_type=%u "
+				      "q_type=%u",
+				      h_result.status,
+				      h_result.op_type,
+				      h_result.q_type);
+			if (h_result.status != EFA_IO_COMP_STATUS_OK ||
+			    h_result.op_type != EFA_CUDA_WC_RDMA_WRITE ||
+			    h_result.q_type != EFA_IO_SEND_QUEUE) {
+				NCCL_OFI_WARN("R0: unexpected signal CQ completion");
+				local_pass = 0;
+			}
 		}
 	}
 
@@ -311,7 +317,6 @@ int main(int argc, char *argv[])
 		      "Rank %d: after  -- remote_write_cntr=%lu write_cntr=%lu",
 		      rank, rw_cntr_after, w_cntr_after);
 
-	int local_pass = 1;
 	if (rank == 0) {
 		bool ok = (w_cntr_after == w_cntr_before + 1);
 		NCCL_OFI_INFO(NCCL_NET, "R0: write_cntr delta=%lu (%s)",

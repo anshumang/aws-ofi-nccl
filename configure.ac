@@ -15,17 +15,6 @@ AC_INIT([aws-ofi-nccl],
 AC_PREREQ([2.69])
 AC_CONFIG_SRCDIR([src/nccl_ofi_net.cpp])
 
-AC_MSG_CHECKING([for required efa-dp-direct CUDA sources])
-AS_IF([test -f "$srcdir/3rd-party/efa-gda/CUDA/README.md"],
-      [AC_MSG_RESULT([yes])],
-      [AC_MSG_RESULT([no])
-       AC_MSG_ERROR([Missing required file:
-  3rd-party/efa-gda/CUDA/README.md
-
-3rd-party/efa-gda is vendored directly in this repository and is not a Git
-submodule. A missing file here means the source tree is incomplete. Re-checkout
-the repository or build from a release tarball.])])
-
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_HEADERS([include/config.h])
 AC_CONFIG_MACRO_DIRS([m4])

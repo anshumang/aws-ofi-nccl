@@ -11,14 +11,17 @@
  *
  * It exercises only the input-validation branches, which return before
  * createContext touches collComm, so no MPI / connected communicator is
- * needed. The accept path (backendVersion 0/1) is covered by the end-to-end
- * GDAKI GPU tests, which require a real communicator.
+ * needed.
  *
  * Expected (only meaningful in a GDAKI-enabled build, i.e. HAVE_GDAKI):
  *   config == NULL                              -> ncclInvalidArgument
  *   backendVersion < 0  (e.g. -1)               -> ncclInvalidArgument
+ *   backendVersion == 0                          -> ncclInvalidArgument
  *   backendVersion > MAX (e.g. MAX+1)           -> ncclInvalidArgument
  *
+ * The backendVersion-2 accept path needs a real communicator and is covered by
+ * the end-to-end GDAKI GPU tests. Backend version 1 selects the original layout
+ * and is covered in its matching NCCL consumer integration run.
  */
 
 #include "config.h"
@@ -26,9 +29,7 @@
 #include "functional_test.h"
 
 #if HAVE_GDAKI
-/* Pulls in efa-dp-direct's efa_cuda_dp_types.h; only available (and only
- * needed) in a GDAKI build. */
-#include "rdma/gin/nccl_ofi_gin_gdaki_dev.h"  /* NCCL_OFI_GDAKI_MAX_BACKEND_VERSION */
+#include "rdma/gin/nccl_ofi_gin_gdaki_dev.h"  /* backend version MIN/MAX */
 #endif
 
 #include <cstdio>
@@ -118,7 +119,19 @@ int main(int argc, char *argv[])
 		failures += !ok;
 	}
 
-	/* Case 3: backendVersion above what the plugin supports. */
+	/* Case 3: backendVersion 0 predates the EFA GDA backend. */
+	{
+		test_nccl_gin_config_t cfg = {};
+		cfg.backendVersion = 0;
+		ncclResult_t rc = gin->createContext(collComm, &cfg,
+						     &ginCtx, &devHandle);
+		bool ok = (rc == ncclInvalidArgument);
+		fprintf(stderr, "backend_version: version=0 -> %d (%s)\n",
+			rc, ok ? "PASS" : "FAIL");
+		failures += !ok;
+	}
+
+	/* Case 4: backendVersion above what the plugin supports. */
 	{
 		test_nccl_gin_config_t cfg = {};
 		cfg.backendVersion = NCCL_OFI_GDAKI_MAX_BACKEND_VERSION + 1;
