@@ -1211,6 +1211,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext_v14(void *collComm, ncclGin
 	 */
 	switch (config->backendVersion) {
 	case 1:
+	case 2:
 		break;
 	default:
 		NCCL_OFI_WARN("gin GDAKI: unsupported backendVersion %d "

@@ -18,10 +18,12 @@ AC_CONFIG_SRCDIR([src/nccl_ofi_net.cpp])
 AC_MSG_CHECKING([for required efa-dp-direct CUDA sources])
 AS_IF([test -f "$srcdir/3rd-party/efa-gda/CUDA/README.md" &&
        test -f "$srcdir/3rd-party/efa-gda/CUDA/host/efa_cuda_dp_v1.h" &&
-       test -f "$srcdir/3rd-party/efa-gda/CUDA/host/efa_cuda_dp_v1.cpp"],
+       test -f "$srcdir/3rd-party/efa-gda/CUDA/host/efa_cuda_dp_v1.cpp" &&
+       test -f "$srcdir/3rd-party/efa-gda/CUDA/host/efa_cuda_dp_v2.h" &&
+       test -f "$srcdir/3rd-party/efa-gda/CUDA/host/efa_cuda_dp_v2.cpp"],
       [AC_MSG_RESULT([yes])],
       [AC_MSG_RESULT([no])
-       AC_MSG_ERROR([Missing required efa-dp-direct v1 CUDA sources under:
+       AC_MSG_ERROR([Missing required versioned efa-dp-direct CUDA sources under:
   3rd-party/efa-gda/CUDA
 
 3rd-party/efa-gda is vendored directly in this repository and is not a Git

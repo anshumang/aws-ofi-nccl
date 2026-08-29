@@ -18,20 +18,25 @@ EXTRA_DIST = \
 noinst_HEADERS = \
 	efa-gda/CUDA/common/efa_cuda_dp_types.h \
 	efa-gda/CUDA/common/efa_cuda_dp_types_v1.h \
+	efa-gda/CUDA/common/efa_cuda_dp_types_v2.h \
 	efa-gda/CUDA/device/efa_cuda_dp_defs.cuh \
 	efa-gda/CUDA/device/efa_cuda_dp_impl.cuh \
 	efa-gda/CUDA/device/efa_io_defs.h \
 	efa-gda/CUDA/host/efa_cuda_dp.h \
-	efa-gda/CUDA/host/efa_cuda_dp_v1.h
+	efa-gda/CUDA/host/efa_cuda_dp_v1.h \
+	efa-gda/CUDA/host/efa_cuda_dp_v2.h
 
 if HAVE_GDAKI
 AM_CPPFLAGS = \
 	-I$(abs_top_srcdir)/include \
 	-isystem $(abs_srcdir)/efa-gda/CUDA/common \
+	-isystem $(abs_srcdir)/efa-gda/CUDA/device \
 	-isystem $(abs_srcdir)/efa-gda/CUDA/host
 
 noinst_LTLIBRARIES = libefa_cuda_dp.la
 
 libefa_cuda_dp_la_SOURCES = \
-	efa-gda/CUDA/host/efa_cuda_dp_v1.cpp
+	efa-gda/CUDA/host/efa_cuda_dp.cpp \
+	efa-gda/CUDA/host/efa_cuda_dp_v1.cpp \
+	efa-gda/CUDA/host/efa_cuda_dp_v2.cpp
 endif
