@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
-#ifndef EFA_CUDA_DP_TYPES_H
-#define EFA_CUDA_DP_TYPES_H
+#ifndef EFA_CUDA_DP_TYPES_V2_H
+#define EFA_CUDA_DP_TYPES_V2_H
 
 #include <stdint.h>
 
-#define EFA_CUDA_DP_VERSION_MAJOR 0
-#define EFA_CUDA_DP_VERSION_MINOR 0
-#define EFA_CUDA_DP_VERSION_SUBMINOR 2
-
-struct efa_cuda_cq {
+/*
+ * Backend version 2 is frozen from Gerrit commit ca1f6b0.
+ * Layout changes require a new backend version.
+ */
+struct efa_cuda_cq_v2 {
 	uint64_t comp_mask;
 	uint32_t entry_size;
 	uint32_t num_entries;
@@ -22,7 +22,7 @@ struct efa_cuda_cq {
 	uint32_t *db;
 };
 
-struct efa_cuda_wq {
+struct efa_cuda_wq_v2 {
 	uint32_t max_sge;
 	uint32_t max_wqes;
 	uint32_t queue_mask;
@@ -37,11 +37,11 @@ struct efa_cuda_wq {
 	uint32_t *db;
 };
 
-struct efa_cuda_rq {
-	struct efa_cuda_wq wq;
+struct efa_cuda_rq_v2 {
+	struct efa_cuda_wq_v2 wq;
 };
 
-struct efa_cuda_wr_ctx {
+struct efa_cuda_wr_ctx_v2 {
 	uint8_t remote_mem_offset;
 	uint8_t local_mem_offset;
 	uint8_t sgl_offset;
@@ -52,15 +52,22 @@ struct efa_cuda_wr_ctx {
 	uint16_t wqe_size;
 };
 
-struct efa_cuda_sq {
-	struct efa_cuda_wq wq;
-	struct efa_cuda_wr_ctx wr_ctx;
+struct efa_cuda_sq_v2 {
+	struct efa_cuda_wq_v2 wq;
+	struct efa_cuda_wr_ctx_v2 wr_ctx;
 };
 
-struct efa_cuda_qp {
+struct efa_cuda_qp_v2 {
 	uint64_t comp_mask;
-	struct efa_cuda_sq sq;
-	struct efa_cuda_rq rq;
+	struct efa_cuda_sq_v2 sq;
+	struct efa_cuda_rq_v2 rq;
 };
+
+typedef struct efa_cuda_cq_v2 efa_cuda_cq_v2;
+typedef struct efa_cuda_wq_v2 efa_cuda_wq_v2;
+typedef struct efa_cuda_rq_v2 efa_cuda_rq_v2;
+typedef struct efa_cuda_wr_ctx_v2 efa_cuda_wr_ctx_v2;
+typedef struct efa_cuda_sq_v2 efa_cuda_sq_v2;
+typedef struct efa_cuda_qp_v2 efa_cuda_qp_v2;
 
 #endif
