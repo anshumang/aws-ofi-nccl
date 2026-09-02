@@ -14,10 +14,10 @@
 
 #include "efa_cuda_dp.h"
 
+#include <algorithm>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_ext_efa.h>
 
-static constexpr uint32_t gdaki_narrow_wqe_inline_size = 32;
 static constexpr uint32_t gdaki_max_rdma_sges = 1;
 
 #define NCCL_OFI_GDAKI_EFA_DP_API_MAJOR_V0 0
@@ -85,7 +85,9 @@ static gdaki_efa_dp_context gdaki_create_efa_dp_context(int backend_version)
  * so FI_SOURCE is not requested. FI_HMEM is still needed because the endpoint
  * is used to access GPU memory. efa-direct requires FI_CONTEXT2 per fi_efa(7).
  */
-static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info)
+static void get_gdaki_hints(struct fi_info &hints,
+			    struct fi_info *ref_info,
+			    uint32_t inline_write_size)
 {
 	hints.caps = FI_MSG | FI_RMA | FI_HMEM;
 	hints.mode = FI_CONTEXT2;
@@ -100,6 +102,17 @@ static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info)
 	hints.domain_attr->control_progress = FI_PROGRESS_AUTO;
 	hints.domain_attr->data_progress = FI_PROGRESS_AUTO;
 
+	/*
+	 * EFA uses inject_size above its default inline limit as the opt-in for
+	 * RDMA-write inline and a wide WQE. Request the smallest value that both
+	 * crosses that provider-reported limit and carries the required payload.
+	 */
+	if (inline_write_size != 0) {
+		hints.tx_attr->inject_size =
+			std::max(ref_info->tx_attr->inject_size + 1,
+				 static_cast<size_t>(inline_write_size));
+	}
+
 	/* Narrow fi_getinfo to the provider / fabric / domain the proxy
 	 * already opened. Names are required to obtain exactly one result. */
 	hints.fabric_attr->prov_name = strdup(ref_info->fabric_attr->prov_name);
@@ -111,13 +124,19 @@ static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info)
  * Obtain a GDAKI-owned fi_info via fi_getinfo, narrowed to exactly the
  * fabric / domain the proxy reference points at.
  */
-static struct fi_info *get_gdaki_info(struct fi_info *ref_info)
+static struct fi_info *get_gdaki_info(struct fi_info *ref_info, uint32_t inline_write_size)
 {
+	if (inline_write_size != 0 &&
+	    (ref_info == nullptr || ref_info->tx_attr == nullptr)) {
+		throw std::runtime_error(
+			"gin GDAKI: reference info has no transmit attributes");
+	}
+
 	struct fi_info *hints = fi_allocinfo();
 	if (hints == nullptr) {
 		throw std::runtime_error("fi_allocinfo for GDAKI hints failed");
 	}
-	get_gdaki_hints(*hints, ref_info);
+	get_gdaki_hints(*hints, ref_info, inline_write_size);
 
 	struct fi_info *results = nullptr;
 	int ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0ULL,
@@ -140,14 +159,17 @@ static struct fi_info *get_gdaki_info(struct fi_info *ref_info)
 	return results;
 }
 
-void gdaki_fi_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			     size_t cq_size)
+void gdaki_fi_endpoint::open(struct fid_domain *domain,
+			     struct fi_info *ref_info,
+			     size_t cq_size,
+			     uint32_t inline_write_size)
 {
 	if (ep || cq || av || info) {
 		throw std::runtime_error("gdaki_fi_endpoint: double open");
 	}
 
-	info = get_gdaki_info(ref_info);
+	info = get_gdaki_info(ref_info, inline_write_size);
+	inline_write_size_ = inline_write_size;
 
 	struct fi_cq_attr cq_attr = {};
 	cq_attr.format = FI_CQ_FORMAT_DATA;
@@ -206,6 +228,7 @@ void gdaki_fi_endpoint::bind(struct fid *fid, uint64_t flags)
 void gdaki_gpu_qp::build(int backend_version_in,
 			 const struct fi_efa_wq_attr &sq_attr,
 			 const struct fi_efa_wq_attr &rq_attr,
+			 uint32_t sq_max_inline_data,
 			 void *sq_buf_dev, void *sq_db_dev)
 {
 	if (qp.size() != 0) {
@@ -227,7 +250,9 @@ void gdaki_gpu_qp::build(int backend_version_in,
 	case NCCL_OFI_GDAKI_BACKEND_VERSION_1:
 		break;
 	case NCCL_OFI_GDAKI_BACKEND_VERSION_2:
-		attrs.sq_max_inline_data = gdaki_narrow_wqe_inline_size;
+		/* efa-dp-direct validates this requirement against the actual
+		 * WQE geometry reported in sq_attr. */
+		attrs.sq_max_inline_data = sq_max_inline_data;
 		attrs.sq_max_rdma_sges = gdaki_max_rdma_sges;
 		/*
 		 * efa-dp-direct v1 writes 64-bit request IDs. NCCL uses the
@@ -386,10 +411,12 @@ void gdaki_target_addressing::populate(gdaki_fi_endpoint &endpoint,
 	qkeys.commit();
 }
 
-void gdaki_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			  size_t cq_size)
+void gdaki_endpoint::open(struct fid_domain *domain,
+			  struct fi_info *ref_info,
+			  size_t cq_size,
+			  uint32_t inline_write_size)
 {
-	endpoint.open(domain, ref_info, cq_size);
+	endpoint.open(domain, ref_info, cq_size, inline_write_size);
 	endpoint.enable();
 }
 
@@ -412,7 +439,8 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 	 * so our GPU-side mapping covers the same region rdma-core opened. */
 	sq_doorbell.map(sq_attr.doorbell, system_page_size);
 
-	gpu_qp.build(backend_version, sq_attr, rq_attr, sq_buffer.dev, sq_doorbell.dev);
+	gpu_qp.build(backend_version, sq_attr, rq_attr, endpoint.inline_write_size(),
+		     sq_buffer.dev, sq_doorbell.dev);
 
 	/* Stash SQ ring depth for the device-side SQ-overflow backpressure
 	 * check. Both gdaki_data_endpoint and gdaki_sc_endpoint read this
@@ -433,15 +461,18 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 	targets.populate(endpoint, all_addrs, ep_addr_len, total_slots, nranks, gda_ops);
 }
 
-void gdaki_data_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			       struct fi_efa_ops_gda *gda_ops, uint64_t cntr_flags)
+void gdaki_data_endpoint::open(struct fid_domain *domain,
+			       struct fi_info *ref_info,
+			       struct fi_efa_ops_gda *gda_ops,
+			       uint64_t cntr_flags,
+			       uint32_t inline_write_size)
 {
 	/* Create the counter first; it will be bound to the inner endpoint
 	 * between open() and enable(). */
 	local_cntr.create(gda_ops, domain);
 
 	/* Open the inner endpoint without enable. */
-	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size());
+	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size(), inline_write_size);
 
 	base.endpoint.bind(&local_cntr.get()->fid, cntr_flags);
 
@@ -467,7 +498,7 @@ void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info
 
 	/* Open the inner endpoint without enable. Use the same CQ sizing as
 	 * the data endpoint so callers get consistent capacity per env config. */
-	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size());
+	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size(), /* inline_write_size */ 0);
 
 	/* Bind counters before enabling. */
 	base.endpoint.bind(&write_cntr.get()->fid, FI_WRITE);

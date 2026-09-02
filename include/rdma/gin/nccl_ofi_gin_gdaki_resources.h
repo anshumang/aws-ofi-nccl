@@ -194,9 +194,14 @@ public:
 	 * Open EP + CQ + AV on `domain`, bind CQ and AV.
 	 * Does NOT enable — caller must call enable() after any
 	 * additional binds (e.g. counters).
+	 *
+	 * A nonzero inline_write_size asks EFA for an RDMA-write-inline-capable
+	 * endpoint; zero keeps the narrow WQE and full SQ depth.
 	 */
-	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  size_t cq_size);
+	void open(struct fid_domain *domain,
+		  struct fi_info *ref_info,
+		  size_t cq_size,
+		  uint32_t inline_write_size);
 
 	/*
 	 * Enable the endpoint. Must be called after open() and
@@ -209,6 +214,14 @@ public:
 	 * Throws on failure.
 	 */
 	void bind(struct fid *fid, uint64_t flags);
+
+	uint32_t inline_write_size() const
+	{
+		return inline_write_size_;
+	}
+
+private:
+	uint32_t inline_write_size_ = 0;
 };
 
 /**
@@ -290,6 +303,7 @@ public:
 	void build(int backend_version,
 		   const struct fi_efa_wq_attr &sq_attr,
 		   const struct fi_efa_wq_attr &rq_attr,
+		   uint32_t sq_max_inline_data,
 		   void *sq_buf_dev, void *sq_db_dev);
 
 	/** GPU pointer to the QP; its layout is version(). */
@@ -504,7 +518,10 @@ public:
 	/**
 	 * Open EP + CQ + AV on the proxy domain and enable.
 	 */
-	void open(struct fid_domain *domain, struct fi_info *ref_info, size_t cq_size);
+	void open(struct fid_domain *domain,
+		  struct fi_info *ref_info,
+		  size_t cq_size,
+		  uint32_t inline_write_size);
 
 	/**
 	 * Query EFA QP/CQ attributes, map the SQ MMIO regions for GPU
@@ -551,8 +568,11 @@ public:
 	 * FI_WRITE for an endpoint that only writes, FI_WRITE | FI_READ for one
 	 * that also issues reads.
 	 */
-	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  struct fi_efa_ops_gda *gda_ops, uint64_t cntr_flags);
+	void open(struct fid_domain *domain,
+		  struct fi_info *ref_info,
+		  struct fi_efa_ops_gda *gda_ops,
+		  uint64_t cntr_flags,
+		  uint32_t inline_write_size);
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors (QP/CQ attrs,
