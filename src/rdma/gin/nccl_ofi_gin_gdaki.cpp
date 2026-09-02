@@ -735,6 +735,10 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		constexpr size_t ep_addr_len = MAX_EP_ADDR;
 		const int local_n_sc = std::max(config->nSignals, config->nCounters);
 		const int global_n_sc = ctx->global_n_sc;
+		const uint32_t putvalue_inline_size =
+			backend_version >= NCCL_OFI_GDAKI_BACKEND_VERSION_2
+				? NCCL_OFI_GDAKI_PUTVALUE_SLOT_SIZE
+				: 0;
 		/* Endpoint slot layout within one context's batched allgather:
 		 * slot 0 = data EP, slots [1, 1+global_n_sc) = sc EPs. A rank
 		 * with fewer than global_n_sc sc EPs leaves the surplus slots
@@ -758,7 +762,13 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			 * rail_id = ctx_id % num_rails).
 			 */
 			/* The data endpoint issues both Put and Get, so it counts reads too. */
-			ctx->data[ctx_id]->open(ofi_domain, proxy_info, gda_ops, FI_WRITE | FI_READ);
+			/* Put and Get carry their payload through the SGE, so the data
+			 * endpoint keeps the 64B entry and the full SQ depth. */
+			ctx->data[ctx_id]->open(ofi_domain,
+						proxy_info,
+						gda_ops,
+						FI_WRITE | FI_READ,
+						/* inline_write_size */ 0);
 			if (local_n_sc > 0) {
 				ctx->sc_endpoints[ctx_id].reserve(local_n_sc);
 			}
@@ -768,7 +778,11 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			}
 			/* Dedicated PutValue poster endpoint. */
 			/* PutValue only writes. */
-			ctx->pvdata[ctx_id]->open(ofi_domain, proxy_info, gda_ops, FI_WRITE);
+			/* Backend version 2 and later carry up to eight bytes as WQE
+			 * inline data, so their PutValue endpoint takes the wide entry
+			 * (at half SQ depth). Backend version 1 keeps the narrow entry. */
+			ctx->pvdata[ctx_id]->open(
+				ofi_domain, proxy_info, gda_ops, FI_WRITE, putvalue_inline_size);
 
 			/*
 			 * Step 5: Exchange ALL of this ctx's endpoint addresses in a
@@ -848,9 +862,12 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		}
 
 		NCCL_OFI_INFO(NCCL_NET,
-			      "gin GDAKI: backendVersion %d, SQ %u entries x %u bytes",
+			      "gin GDAKI: backendVersion %d, data SQ %u entries x %u bytes, "
+			      "PutValue SQ %u entries x %u bytes",
 			      ctx->backend_version, ctx->data[0]->base.sq_size,
-			      ctx->data[0]->base.sq_entry_size);
+			      ctx->data[0]->base.sq_entry_size,
+			      ctx->pvdata[0]->base.sq_size,
+			      ctx->pvdata[0]->base.sq_entry_size);
 
 		/*
 		 * Step 7: PutValue source slot pool. Must run after every

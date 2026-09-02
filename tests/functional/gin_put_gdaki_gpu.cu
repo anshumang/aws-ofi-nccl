@@ -59,6 +59,7 @@ __global__ void gin_put_gpu_kernel(nccl_ofi_gin_gdaki_dev_handle *dev,
 	auto *qp = reinterpret_cast<efa_cuda_qp *>(dev->data.qp);
 	auto *cq = reinterpret_cast<efa_cuda_cq *>(dev->data.cq);
 
+	/* Max-sized scratch storage; wr_ctx selects the actual WQE width. */
 	efa_io_tx_wqe_128 wr;
 	EfaCudaWrBuilder wr_builder(&qp->sq.wr_ctx, reinterpret_cast<uint8_t *>(&wr));
 	if (wr_builder.init_rdma_write(/*wr_id=*/0, dst_rkey, dst_addr) != 0) return;
