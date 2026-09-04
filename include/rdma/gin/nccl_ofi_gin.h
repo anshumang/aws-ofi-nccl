@@ -503,15 +503,21 @@ public:
 	/* Shared core behind the proxy regMrSymDmaBuf and the GDAKI regMrSymDmaBuf
 	 * entry point: duplicate detection/refcount, local EFA registration, MR-map
 	 * insertion, and the per-rank key all-gather. Leaves gdr_handle == nullptr;
-	 * GDRCopy (proxy only) is layered on top by the caller. Caller holds ep_lock. */
+	 * GDRCopy (proxy only) is layered on top by the caller. Caller holds ep_lock.
+	 *
+	 * The all-gather publishes the keys reg_domain's registration produced, so
+	 * reg_domain must cover this comm's device, every rank must pass a domain with
+	 * the same rail count, and the endpoints that use these keys must open on it. */
 	int regMrSymDmaBufCommon(nccl_ofi_mr_ckey_ref ckey, void *data_ptr, size_t size, int type,
+				 nccl_ofi_gin_domain_t &reg_domain,
 				 nccl_ofi_rdma_gin_symm_mr_handle **mr_handle_out)
 		REQUIRES(get_ep_lock());
 
-	/* Local part of symmetric memory registration: allocate the handle,
-	 * register data_ptr with the endpoint, and fill in this rank's entry of
-	 * the handle's per-rank metadata table. Caller must hold ep_lock. */
+	/* Local part of symmetric memory registration: allocate the handle, register
+	 * data_ptr on reg_domain, and fill in this rank's entry of the handle's
+	 * per-rank metadata table from that registration. Caller must hold ep_lock. */
 	int regMrSymLocal(nccl_ofi_mr_ckey_ref ckey, void *data_ptr, size_t size, int type,
+			  nccl_ofi_gin_domain_t &reg_domain,
 			  nccl_ofi_rdma_gin_symm_mr_handle **mr_handle_out)
 		REQUIRES(get_ep_lock());
 

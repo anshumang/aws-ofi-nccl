@@ -59,6 +59,39 @@
  */
 class gdaki_context_registry {
 public:
+	/**
+	 * The collComm's GDA GIN domain, created on first use and shared by every
+	 * window registration and context on that comm. The registry owns it until
+	 * release_gin_domain, because window registrations both precede the first
+	 * context and outlive the last one.
+	 */
+	std::shared_ptr<nccl_ofi_gdaki_gin_domain_t> get_gin_domain(void *collComm)
+	{
+		auto *put_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
+		auto &gin_ep = put_comm->get_resources().get_ep();
+		uint16_t num_rails = gin_ep.get_num_rails();
+		if (num_rails > NCCL_OFI_GDAKI_MAX_RAILS) {
+			num_rails = NCCL_OFI_GDAKI_MAX_RAILS;
+		}
+
+		std::lock_guard<std::mutex> lock(mu);
+		auto &shared = gin_domain_map[collComm];
+		if (!shared) {
+			shared = std::make_shared<nccl_ofi_gdaki_gin_domain_t>(gin_ep.get_domain(),
+								     num_rails,
+								     put_comm->get_dev());
+		}
+		return shared;
+	}
+
+	/** Drop the comm's GDA GIN domain. closeColl calls this after it has
+	 * destroyed the comm's contexts. */
+	void release_gin_domain(void *collComm)
+	{
+		std::lock_guard<std::mutex> lock(mu);
+		gin_domain_map.erase(collComm);
+	}
+
 	/** Register a newly-created context against its collComm. */
 	void add(void *collComm, nccl_ofi_gin_gdaki_context *ctx)
 	{
@@ -105,6 +138,8 @@ public:
 
 private:
 	std::mutex mu;
+	/* Each collComm's GDA GIN domain, owned until release_gin_domain. */
+	std::unordered_map<void *, std::shared_ptr<nccl_ofi_gdaki_gin_domain_t>> gin_domain_map;
 	std::unordered_map<void *, std::vector<nccl_ofi_gin_gdaki_context *>> map;
 };
 
@@ -256,12 +291,10 @@ static void setup_scratch_buffer(nccl_ofi_gin_gdaki_context *ctx,
 	}
 	ctx->scratch_local_addr = (uint64_t)ctx->scratch_buf;
 
-	auto &domain = put_comm->get_resources().get_ep().get_domain();
-
-	/* Register the shared scratch buffer on each used rail's domain,
+	/* Register the shared scratch buffer on each used rail's GDA domain,
 	 * allgather per-rail, and populate GPU buffers. */
 	for (uint16_t r = 0; r < ctx->effective_rails; r++) {
-		struct fid_domain *dom_r = domain.get_ofi_domain(r).get();
+		struct fid_domain *dom_r = ctx->gin_domain->get_ofi_domain(r).get();
 		if (dom_r == nullptr) {
 			throw std::runtime_error(
 				"scratch: rail " + std::to_string(r) + " domain is null");
@@ -390,9 +423,8 @@ static void setup_putvalue_pool(nccl_ofi_gin_gdaki_context *ctx,
 	 * pool's GPU VA (and hence every endpoint's slice base) is the same
 	 * across rails; only the lkey differs per rail. A logical context
 	 * bound to rail r reads its putvalue lkey from rail_shared[r]. */
-	auto &domain = put_comm->get_resources().get_ep().get_domain();
 	for (uint16_t r = 0; r < ctx->effective_rails; r++) {
-		struct fid_domain *dom_r = domain.get_ofi_domain(r).get();
+		struct fid_domain *dom_r = ctx->gin_domain->get_ofi_domain(r).get();
 		if (dom_r == nullptr) {
 			throw std::runtime_error(
 				"putvalue: rail " + std::to_string(r) + " domain is null");
@@ -586,15 +618,14 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 
 	try {
 		/*
-		 * Step 1: Reuse the proxy plugin's libfabric domains, one per
-		 * rail (EFA NIC).
+		 * Step 1: Create the GDA domain, one per rail (EFA NIC), from
+		 * GDA's own fi_getinfo on the fabric the proxy already opened for
+		 * that NIC. The proxy plugin's rail info names the NIC.
 		 *
-		 * On libfabric 2.4+ the proxy plugin selects the "efa-direct"
-		 * fabric (see nccl_ofi_ofiutils_get_providers +
-		 * prov_filter_by_match against the first entry, which is
-		 * efa-direct). Each rail's domain exposes FI_EFA_GDA_OPS.
-		 * Reusing them ensures MR keys registered via extGin->regMrSym
-		 * are valid on the endpoints we open here.
+		 * The endpoints, completion queues and memory registrations open
+		 * on this domain, so every MR the device dereferences (scratch,
+		 * putvalue pool, and each window from regMrSym) is registered on
+		 * it and its keys are valid on the endpoints opened here.
 		 *
 		 * Multi-rail: logical context c is bound to rail
 		 * c % num_rails, so its data + sc endpoints open on that rail's
@@ -602,7 +633,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		 * many rails get used (and get the shared scratch/putvalue MRs).
 		 */
 		auto &gin_ep = put_comm->get_resources().get_ep();
-		auto &domain = gin_ep.get_domain();
+		ctx->gin_domain = gdaki_contexts.get_gin_domain(collComm);
 		uint16_t num_rails = gin_ep.get_num_rails();
 		if (num_rails == 0) {
 			throw std::runtime_error("gin endpoint reports zero rails");
@@ -627,28 +658,28 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		}
 
 		/*
-		 * Step 2: Per-rail GDA ops table and fi_info, indexed by rail
-		 * id. Open FI_EFA_GDA_OPS on each used rail's domain (used by
-		 * data EPs to bind the FI_WRITE counter, data.populate(), and
-		 * sc EPs).
+		 * Step 2: Per-rail GDA domain, ops table and fi_info, indexed by
+		 * rail id. Each rail's domain is created from GDA's own fi_getinfo,
+		 * narrowed to that rail's NIC names, and exposes FI_EFA_GDA_OPS
+		 * (used by data EPs to bind the counter, data.populate(), and sc EPs).
 		 */
 		struct fi_efa_ops_gda *gda_ops_rail[NCCL_OFI_GDAKI_MAX_RAILS] = {};
-		struct fi_info *proxy_info_rail[NCCL_OFI_GDAKI_MAX_RAILS] = {};
+		struct fi_info *gda_info_rail[NCCL_OFI_GDAKI_MAX_RAILS] = {};
+		struct fid_domain *gda_domain_rail[NCCL_OFI_GDAKI_MAX_RAILS] = {};
 		for (uint16_t r = 0; r < ctx->effective_rails; r++) {
-			struct fid_domain *dom_r = domain.get_ofi_domain(r).get();
-			if (dom_r == nullptr) {
-				throw std::runtime_error(
-					"rail " + std::to_string(r) + " domain is null");
-			}
 			struct fi_info *info_r = device->get_ofi_info(r);
 			if (info_r == nullptr) {
 				throw std::runtime_error(
 					"rail " + std::to_string(r) + " fi_info is null");
 			}
 
+			/* This rail's GDA domain, opened by the GIN domain's constructor. */
+			struct fid_domain *dom_r =
+				ctx->gin_domain->get_ofi_domain(r).get();
+
 			/*
 			 * Per-platform gate, applied to each rail's domain
-			 * before we open GDA ops / endpoints / counters on it.
+			 * before we open endpoints / counters on it.
 			 * The GDAKI hardware completion counter is a
 			 * domain-scoped capability (opened on the domain, before
 			 * any endpoint exists), so the platform authorizes each
@@ -660,24 +691,15 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			 * ncclSystemError.
 			 */
 			if (PlatformManager::get_global().get_platform().config_gdaki_domain(
-				    dom_r, info_r) != 0) {
+				    dom_r, ctx->gin_domain->get_rail(r).info.get()) != 0) {
 				NCCL_OFI_WARN("gin GDAKI: not supported on this platform; "
 					      "cannot create a GDAKI context here");
 				return ncclInvalidUsage;
 			}
 
-			struct fi_efa_ops_gda *ops_r = nullptr;
-			int ret = fi_open_ops(&dom_r->fid, FI_EFA_GDA_OPS, 0,
-					      reinterpret_cast<void **>(&ops_r), nullptr);
-			if (ret != 0 || ops_r == nullptr) {
-				throw std::runtime_error(
-					"fi_open_ops FI_EFA_GDA_OPS on rail " +
-					std::to_string(r) + " failed "
-					"(libfabric too old, or proxy selected non-efa-direct fabric): " +
-					std::string(ret ? fi_strerror(-ret) : "no ops table"));
-			}
-			gda_ops_rail[r] = ops_r;
-			proxy_info_rail[r] = info_r;
+			gda_ops_rail[r] = ctx->gin_domain->get_rail(r).gda_ops;
+			gda_info_rail[r] = ctx->gin_domain->get_rail(r).info.get();
+			gda_domain_rail[r] = dom_r;
 		}
 
 		/* Pre-size all per-ctx vectors and the contiguous dev_handles[]
@@ -750,22 +772,22 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			 * (ctx_id % num_rails)'s domain. Distinct contextIds
 			 * therefore spread across the GPU's NICs. */
 			const uint16_t rail_id = (uint16_t)(ctx_id % num_rails);
-			struct fid_domain *ofi_domain = domain.get_ofi_domain(rail_id).get();
-			struct fi_info *proxy_info = proxy_info_rail[rail_id];
+			struct fid_domain *ofi_domain = gda_domain_rail[rail_id];
+			struct fi_info *gda_info = gda_info_rail[rail_id];
 			struct fi_efa_ops_gda *gda_ops = gda_ops_rail[rail_id];
 
 			/*
 			 * Step 4: Open this ctx's endpoints — data EP (slot 0) and
 			 * this rank's local sc EPs (slots 1..local_n_sc). Surplus sc
 			 * slots have no local endpoint. All open on this ctx's rail
-			 * domain (ofi_domain / proxy_info / gda_ops selected above by
+			 * domain (ofi_domain / gda_info / gda_ops selected above by
 			 * rail_id = ctx_id % num_rails).
 			 */
 			/* The data endpoint issues both Put and Get, so it counts reads too. */
 			/* Put and Get carry their payload through the SGE, so the data
 			 * endpoint keeps the 64B entry and the full SQ depth. */
 			ctx->data[ctx_id]->open(ofi_domain,
-						proxy_info,
+						gda_info,
 						gda_ops,
 						FI_WRITE | FI_READ,
 						/* inline_write_size */ 0);
@@ -774,7 +796,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			}
 			for (int i = 0; i < local_n_sc; i++) {
 				ctx->sc_endpoints[ctx_id].push_back(std::make_unique<gdaki_sc_endpoint>());
-				ctx->sc_endpoints[ctx_id][i]->open(ofi_domain, proxy_info, gda_ops);
+				ctx->sc_endpoints[ctx_id][i]->open(ofi_domain, gda_info, gda_ops);
 			}
 			/* Dedicated PutValue poster endpoint. */
 			/* PutValue only writes. */
@@ -782,7 +804,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			 * inline data, so their PutValue endpoint takes the wide entry
 			 * (at half SQ depth). Backend version 1 keeps the narrow entry. */
 			ctx->pvdata[ctx_id]->open(
-				ofi_domain, proxy_info, gda_ops, FI_WRITE, putvalue_inline_size);
+				ofi_domain, gda_info, gda_ops, FI_WRITE, putvalue_inline_size);
 
 			/*
 			 * Step 5: Exchange ALL of this ctx's endpoint addresses in a
@@ -968,6 +990,11 @@ static ncclResult_t nccl_ofi_gin_gdaki_closeColl(void *collComm)
 		nccl_ofi_gin_gdaki_destroyContext(ctx);
 	}
 
+	/* Drop the comm's GDA domains once its contexts are gone. Any window still
+	 * registered holds its GDA MRs on the local handle, which NCCL deregisters
+	 * before closing the collComm. */
+	gdaki_contexts.release_gin_domain(collComm);
+
 	return nccl_ofi_gin_closeColl(collComm);
 }
 
@@ -990,11 +1017,22 @@ static ncclResult_t nccl_ofi_gin_gdaki_regMrSymDmaBuf(void *collComm, void *data
 		return cret;
 	}
 
+	/* Register the window on this comm's GDA domains, whose keys this comm's
+	 * GDAKI endpoints accept, so the shared all-gather publishes those keys. */
+	std::shared_ptr<nccl_ofi_gdaki_gin_domain_t> gin_domain;
+	try {
+		gin_domain = gdaki_contexts.get_gin_domain(collComm);
+	} catch (const std::exception &e) {
+		NCCL_OFI_WARN("gin GDAKI: opening this comm's GDA domains failed: %s", e.what());
+		return ncclSystemError;
+	}
+
 	nccl_ofi_rdma_gin_symm_mr_handle *mr_handle = nullptr;
 	int ret;
 	{
 		std::lock_guard scoped_ep_lock(comm->get_ep_lock());
-		ret = comm->regMrSymDmaBufCommon(&cache_key, data, size, type, &mr_handle);
+		ret = comm->regMrSymDmaBufCommon(&cache_key, data, size, type, *gin_domain,
+						 &mr_handle);
 	}
 	if (ret != 0) {
 		return nccl_net_ofi_retval_translate(ret);
@@ -1008,24 +1046,21 @@ static ncclResult_t nccl_ofi_gin_gdaki_regMrSymDmaBuf(void *collComm, void *data
 /*
  * GDAKI regMrSym:
  *
- *   1. Call the shared proxy regMrSym. Because createContext opens the
- *      GDAKI endpoint on the same fid_domain that the proxy plugin
- *      registered the MR on, the resulting keys are directly usable
- *      on the GDAKI endpoint; no second registration is needed.
- *   2. Reach through the plugin mhandle to obtain the underlying fid_mr*.
- *   3. Query the local key via gda_ops->get_mr_lkey().
- *   4. Read the plugin's already-allgathered per-peer rkeys from
- *      mhandle->remote_mr[i].mr_key[0] — no second MPI allgather needed.
- *   5. Package lkey + rkeys[nranks] into an nccl_ofi_gin_gdaki_mr_handle
+ *   1. Call the GDAKI regMrSymDmaBuf. It hands this comm's GDA domains to the
+ *      shared registration core, so the window is registered on those domains
+ *      and each rank's address and mr_key are allgathered from them. The GDAKI
+ *      endpoints run on the GDA domains, so those keys are the ones they accept.
+ *   2. Query the local key from that registration via gda_ops->get_mr_lkey().
+ *   3. Read each peer's rkey from mhandle->remote_mr[i].mr_key[rail].
+ *   4. Package lkey + rkeys[nranks] into an nccl_ofi_gin_gdaki_mr_handle
  *      (the layout declared in nccl_ofi_gin_gdaki_dev.h) and return it via
  *      ginHandle. The GPU kernel reads lkey for local SGEs and rkeys[peer]
  *      for remote RDMA writes.
  *
- * The device-visible handle owns no libfabric resources — the underlying
- * fid_mr is owned by the proxy regMrSym path and torn down by its dereg.
- * We stash it on the mhandle's gin_device_handle field so deregMrSym can
- * free it with only the mhandle: NCCL's ncclGinDeregister does not pass
- * ginHandle back to deregMrSym.
+ * The device-visible handle owns no libfabric resources: the window's MRs are
+ * owned by its local_handle and torn down by the shared deregMrSym. It is stashed
+ * on the mhandle's gin_device_handle field, which is what deregMrSym has to work
+ * from: NCCL's ncclGinDeregister passes the mhandle alone.
  */
 static ncclResult_t nccl_ofi_gin_gdaki_regMrSym(void *collComm, void *data, size_t size,
 						int type, uint64_t mrFlags,
@@ -1042,7 +1077,15 @@ static ncclResult_t nccl_ofi_gin_gdaki_regMrSym(void *collComm, void *data, size
 	auto *put_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
 	int nranks = put_comm->get_nranks();
 	auto &gin_ep = put_comm->get_resources().get_ep();
-	auto &domain = gin_ep.get_domain();
+	/* The per-rail GDA domains this window is registered on; step 2 reads each
+	 * rail's local key through the ops table its domain opened. */
+	std::shared_ptr<nccl_ofi_gdaki_gin_domain_t> gin_domain;
+	try {
+		gin_domain = gdaki_contexts.get_gin_domain(collComm);
+	} catch (const std::exception &e) {
+		NCCL_OFI_WARN("gin GDAKI: opening this comm's GDA domains failed: %s", e.what());
+		return ncclSystemError;
+	}
 	uint16_t num_rails = gin_ep.get_num_rails();
 	if (num_rails > NCCL_OFI_GDAKI_MAX_RAILS) {
 		num_rails = NCCL_OFI_GDAKI_MAX_RAILS;
@@ -1109,28 +1152,23 @@ static ncclResult_t nccl_ofi_gin_gdaki_regMrSym(void *collComm, void *data, size
 	 * pointing at the DEVICE address of its sub-handle. The whole block
 	 * is copied to the device below. */
 	for (uint16_t r = 0; r < num_rails; r++) {
-		/* Open GDA ops on rail r's domain and query rail r's lkey.
-		 * fi_open_ops is cheap (returns a static ops table). */
-		struct fid_domain *dom_r = domain.get_ofi_domain(r).get();
-		if (dom_r == nullptr) {
-			NCCL_OFI_WARN("gin GDAKI: regMrSym rail %u domain is null", r);
-			nccl_net_ofi_gpu_mem_free(dev_block);
-			free(block);
-			return ncclSystemError;
-		}
-		struct fi_efa_ops_gda *gda_ops = nullptr;
-		int ret = fi_open_ops(&dom_r->fid, FI_EFA_GDA_OPS, 0,
-				      reinterpret_cast<void **>(&gda_ops), nullptr);
-		if (ret != 0 || gda_ops == nullptr) {
-			NCCL_OFI_WARN("gin GDAKI: fi_open_ops FI_EFA_GDA_OPS on rail %u failed: %s",
-				      r, ret ? fi_strerror(-ret) : "no ops table");
+		/* Query rail r's lkey through the ops table its domain opened. */
+		struct fi_efa_ops_gda *gda_ops = gin_domain->get_rail(r).gda_ops;
+		if (gda_ops == nullptr) {
+			NCCL_OFI_WARN("gin GDAKI: regMrSym rail %u has no GDA ops", r);
 			nccl_net_ofi_gpu_mem_free(dev_block);
 			free(block);
 			return ncclSystemError;
 		}
 
-		struct fid_mr *mr_r = sym->local_handle->get_mr(r);
-		uint32_t lkey_r = (uint32_t)gda_ops->get_mr_lkey(mr_r);
+		struct fid_mr *gda_mr_r = sym->local_handle->get_mr(r);
+		if (gda_mr_r == nullptr) {
+			NCCL_OFI_WARN("gin GDAKI: regMrSym rail %u has no registration", r);
+			nccl_net_ofi_gpu_mem_free(dev_block);
+			free(block);
+			return ncclSystemError;
+		}
+		uint32_t lkey_r = (uint32_t)gda_ops->get_mr_lkey(gda_mr_r);
 
 		/* rail_handles[r] points INTO the DEVICE block (after the
 		 * pointer-array header, at the r-th handle slot), so the GPU can
@@ -1262,7 +1300,7 @@ NCCL_OFI_EXPORT_SYMBOL ncclGin_v14_t ncclGinPlugin_v14 = {
 	.connect = nccl_ofi_gin_connect,
 	.createContext = nccl_ofi_gin_gdaki_createContext_v14,
 	.regMrSym = nccl_ofi_gin_gdaki_regMrSym,
-	.regMrSymDmaBuf = nccl_ofi_gin_regMrSymDmaBuf,
+	.regMrSymDmaBuf = nccl_ofi_gin_gdaki_regMrSymDmaBuf,
 	.deregMrSym = nccl_ofi_gin_gdaki_deregMrSym,
 	.destroyContext = nccl_ofi_gin_gdaki_destroyContext,
 	.closeColl = nccl_ofi_gin_gdaki_closeColl,

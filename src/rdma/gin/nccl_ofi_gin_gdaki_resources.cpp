@@ -80,10 +80,9 @@ static gdaki_efa_dp_context gdaki_create_efa_dp_context(int backend_version)
  * efa-direct provider entry the proxy already opened. This mirrors
  * the proxy plugin's get_gin_hints pattern in nccl_ofi_gin_resources.cpp.
  *
- * GDAKI does not register memory on this EP — the proxy's regMrSym
- * registers on the shared domain — and does not do fi_cq_readfrom,
- * so FI_SOURCE is not requested. FI_HMEM is still needed because the endpoint
- * is used to access GPU memory. efa-direct requires FI_CONTEXT2 per fi_efa(7).
+ * GDAKI registers memory on this endpoint's own domain. FI_HMEM is requested
+ * because the endpoint accesses GPU memory, and efa-direct requires FI_CONTEXT2
+ * per fi_efa(7).
  */
 static void get_gdaki_hints(struct fi_info &hints,
 			    struct fi_info *ref_info,
@@ -138,8 +137,12 @@ static struct fi_info *get_gdaki_info(struct fi_info *ref_info, uint32_t inline_
 	}
 	get_gdaki_hints(*hints, ref_info, inline_write_size);
 
+	/* Request the 2.5 ABI: this info creates the GDA domain the hardware
+	 * completion counter opens on, and below 2.5 the provider reports a domain
+	 * max_cntr_value above the device's completion-counter limit and refuses
+	 * cntr_open_ext. */
 	struct fi_info *results = nullptr;
-	int ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0ULL,
+	int ret = fi_getinfo(FI_VERSION(2, 5), nullptr, nullptr, 0ULL,
 			     hints, &results);
 	fi_freeinfo(hints);
 	if (ret != 0) {
@@ -157,6 +160,69 @@ static struct fi_info *get_gdaki_info(struct fi_info *ref_info, uint32_t inline_
 	}
 
 	return results;
+}
+
+nccl_ofi_gdaki_gin_domain_t::nccl_ofi_gdaki_gin_domain_t(nccl_net_ofi_domain_t &net_domain_arg,
+							 uint16_t num_rails_arg, int dev_id)
+	: nccl_ofi_gin_domain_t(net_domain_arg, num_rails_arg)
+{
+	for (uint16_t rail_id = 0; rail_id < num_rails_arg; rail_id++) {
+		open_rail(rail_id, dev_id);
+	}
+}
+
+void nccl_ofi_gdaki_gin_domain_t::open_rail(uint16_t rail_id, int dev_id)
+{
+	assert(rail_id < rail.size());
+	nccl_ofi_gdaki_rail_t &rail_state = rail[rail_id];
+	/* The constructor opens each rail once, so this rail is still empty. */
+	assert(!rail_state.domain && !rail_state.info);
+
+	auto *plugin = nccl_net_ofi_get_plugin();
+	auto *device = plugin->get_device(dev_id);
+	if (device == nullptr) {
+		throw std::runtime_error("open_rail: get_device returned null");
+	}
+	struct fi_info *ref_info = device->get_ofi_info(rail_id);
+	if (ref_info == nullptr) {
+		throw std::runtime_error("open_rail: rail " + std::to_string(rail_id) +
+					 " fi_info is null");
+	}
+
+	/* The width argument only sets a transmit attribute, which
+	 * fi_domain ignores, so this asks for the defaults; each endpoint runs its own
+	 * get_gdaki_info with the width it needs. */
+	rail_state.info = ofi_info_ptr(get_gdaki_info(ref_info, /* wide_wqe */ false));
+
+	/* The hints name the NIC the proxy already opened, so fi_getinfo reports that
+	 * fabric here. A fabric carries no mode bits, so this domain is created on that
+	 * same fabric. */
+	if (rail_state.info->fabric_attr->fabric == nullptr) {
+		throw std::runtime_error("open_rail: fi_getinfo reported no open "
+					 "fabric for this NIC");
+	}
+
+	/* fi_domain returns the domain in info->domain_attr->domain when that field is
+	 * set, and fi_getinfo fills it with an already-open domain on this NIC. This
+	 * path needs a domain of its own, so clear the field. */
+	rail_state.info->domain_attr->domain = nullptr;
+
+	struct fid_domain *raw_domain = nullptr;
+	int ret = fi_domain(rail_state.info->fabric_attr->fabric, rail_state.info.get(),
+			    &raw_domain, nullptr);
+	if (ret != 0) {
+		throw std::runtime_error("open_rail: fi_domain failed: " +
+					 std::string(fi_strerror(-ret)));
+	}
+
+	rail_state.domain = make_ofi_domain_ptr(raw_domain);
+
+	ret = fi_open_ops(&rail_state.domain->fid, FI_EFA_GDA_OPS, 0,
+			  reinterpret_cast<void **>(&rail_state.gda_ops), nullptr);
+	if (ret != 0 || rail_state.gda_ops == nullptr) {
+		throw std::runtime_error("open_rail: fi_open_ops FI_EFA_GDA_OPS "
+					 "failed: " + std::string(fi_strerror(-ret)));
+	}
 }
 
 void gdaki_fi_endpoint::open(struct fid_domain *domain,

@@ -47,6 +47,61 @@ struct nccl_ofi_gin_ep_rail_t {
 	ofi_ep_ptr ofi_ep;
 };
 
+/*
+ * The libfabric domains a GIN path registers memory on.
+ *
+ * As constructed, get_ofi_domain names the net transport's own domains, which the
+ * host-proxy path registers on. The GDA data path creates domains of its own and
+ * overrides get_ofi_domain to name those. reg_mr below registers on whichever
+ * domains the override supplies, so both paths share it.
+ */
+class nccl_ofi_gin_domain_t {
+public:
+	nccl_ofi_gin_domain_t(nccl_net_ofi_domain_t &net_domain_arg, uint16_t num_rails_arg)
+		: net_domain(net_domain_arg), num_rails(num_rails_arg)
+	{
+	}
+
+	nccl_ofi_gin_domain_t(const nccl_ofi_gin_domain_t &) = delete;
+	nccl_ofi_gin_domain_t &operator=(const nccl_ofi_gin_domain_t &) = delete;
+
+	virtual ~nccl_ofi_gin_domain_t() = default;
+
+	/**
+	 * Register memory region on every rail of this domain
+	 *
+	 * @param ckey: cache key, created by nccl_ofi_mr_ckey_mk_vec or nccl_ofi_mr_ckey_mk_dmabuf
+	 */
+	int reg_mr(nccl_ofi_mr_ckey_ref ckey, int type, nccl_ofi_gin_mr_handle_t **mhandle);
+
+	void dereg_mr(nccl_ofi_gin_mr_handle_t *handle_ptr);
+
+	/**
+	 * Memory de/registration interfaces suitable for freelist use
+	 */
+	static int freelist_regmr_fn(void *gin_domain_ptr, void *data, size_t size, void **mhandle);
+	static int freelist_deregmr_fn(void *handle);
+
+	/**
+	 * @brief	Returns the domain a rail registers memory and opens endpoints on.
+	 */
+	virtual ofi_domain_ptr &get_ofi_domain(uint16_t rail_id)
+	{
+		return net_domain.get_ofi_domain(rail_id);
+	}
+
+	uint16_t get_num_rails() const
+	{
+		return num_rails;
+	}
+
+private:
+	/* Supplies the MR key pool and the device this GIN domain registers for. */
+	nccl_net_ofi_domain_t &net_domain;
+
+	uint16_t num_rails;
+};
+
 /**
  * The GIN endpoint type
  */
@@ -91,21 +146,6 @@ public:
 	{
 		return scheduler;
 	}
-	/**
-	 * Register memory region with this endpoint
-	 *
-	 * @param ckey: cache key, created by nccl_ofi_mr_ckey_mk_vec or nccl_ofi_mr_ckey_mk_dmabuf
-	 */
-	int reg_mr(nccl_ofi_mr_ckey_ref ckey, int type, nccl_ofi_gin_mr_handle_t **mhandle);
-
-	void dereg_mr(nccl_ofi_gin_mr_handle_t *handle_ptr);
-
-	/**
-	 * Memory de/registration interfaces suitable for freelist use
-	 */
-	static int freelist_regmr_fn(void *ep_ptr, void *data, size_t size, void **mhandle);
-	static int freelist_deregmr_fn(void *handle);
-
 	/**
 	 * Process completions for all rails
 	 *
@@ -268,6 +308,11 @@ public:
 		gin_comms[comm_id] = nullptr;
 	}
 
+	nccl_ofi_gin_domain_t &get_gin_domain()
+	{
+		return gin_domain;
+	}
+
 	nccl_ofi_rdma_gin_ep_t &get_ep()
 	{
 		return gin_ep;
@@ -397,6 +442,10 @@ private:
 
 	/* === Tier 1 — accessed every CQ completion and/or iputSignal === */
 	nccl_ofi_gin_ep_holder ep_holder;
+
+	/* The domains this resource registers memory on. Declared before gin_ep so
+	 * it outlives the endpoint that posts against those registrations. */
+	nccl_ofi_gin_domain_t gin_domain;
 
 	nccl_ofi_rdma_gin_ep_t gin_ep;
 

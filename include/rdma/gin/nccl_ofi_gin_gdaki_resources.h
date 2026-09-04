@@ -20,6 +20,7 @@
 #include "config.h"
 
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +37,7 @@
 
 #include "nccl_ofi_cuda.h"
 #include "rdma/gin/nccl_ofi_gin_gdaki_dev.h"
+#include "rdma/gin/nccl_ofi_gin_resources.h"
 
 /**
  * A matched host / GPU memory pair of N T-typed elements.
@@ -153,6 +155,67 @@ public:
 	}
 };
 
+/*
+ * One rail's GDA state: the domain GDA created for that NIC, the info it was
+ * created from, and the ops table opened on it.
+ *
+ * GDA runs its own fi_getinfo for the NIC, so that info governs the endpoints,
+ * completion queues and memory registrations opened on this domain. The domain is
+ * created on the fabric the proxy already opened for the NIC, which a fabric's
+ * lack of mode bits allows; the proxy owns and closes that fabric.
+ */
+struct nccl_ofi_gdaki_rail_t {
+	ofi_domain_ptr domain;
+
+	ofi_info_ptr info;
+
+	struct fi_efa_ops_gda *gda_ops = nullptr;
+};
+
+/*
+ * The GIN domain of the GDA data path for one comm: one libfabric domain per
+ * rail, created by GDA for that comm.
+ *
+ * The registry keys these by collComm so comms are independent, and every
+ * context on a comm shares this one, so a window that regMrSym registers once
+ * has, per rail, a key every one of that comm's contexts accepts. Contexts hold
+ * a shared_ptr, so it outlives the last context using it.
+ */
+class nccl_ofi_gdaki_gin_domain_t : public nccl_ofi_gin_domain_t {
+public:
+	/*
+	 * Create a GDA domain for every rail of dev_id. Throws on failure, so a
+	 * constructed object always has all num_rails_arg rails open.
+	 */
+	nccl_ofi_gdaki_gin_domain_t(nccl_net_ofi_domain_t &net_domain_arg, uint16_t num_rails_arg,
+				    int dev_id);
+
+	nccl_ofi_gdaki_gin_domain_t(const nccl_ofi_gdaki_gin_domain_t &) = delete;
+	nccl_ofi_gdaki_gin_domain_t &operator=(const nccl_ofi_gdaki_gin_domain_t &) = delete;
+
+	/**
+	 * @brief	Returns a rail's GDA state: its domain, the info that domain was
+	 *		created from, and the ops table opened on it.
+	 */
+	const nccl_ofi_gdaki_rail_t &get_rail(uint16_t rail_id) const
+	{
+		assert(rail_id < rail.size() && rail[rail_id].domain);
+		return rail[rail_id];
+	}
+
+	ofi_domain_ptr &get_ofi_domain(uint16_t rail_id) override
+	{
+		assert(rail_id < rail.size() && rail[rail_id].domain);
+		return rail[rail_id].domain;
+	}
+
+private:
+	/* Opens rail_id's GDA domain, the info it is created from, and its ops table. */
+	void open_rail(uint16_t rail_id, int dev_id);
+
+	/* This comm's per-rail GDA state, all opened by the constructor. */
+	std::array<nccl_ofi_gdaki_rail_t, NCCL_OFI_GDAKI_MAX_RAILS> rail;
+};
 /**
  * A libfabric endpoint opened on a borrowed domain.
  *
@@ -735,12 +798,16 @@ struct nccl_ofi_gin_gdaki_context {
 	uint16_t num_rails = 0;
 	uint16_t effective_rails = 0;
 
-	/* Per-ctx data (main) endpoint: libfabric EP on the reused proxy
-	 * domain plus its GPU-side SQ buffer/doorbell mappings, GPU-
-	 * resident QP/CQ descriptors, target addressing, and a
-	 * FI_WRITE hardware counter for completion tracking. One per
-	 * logical context. unique_ptr because gdaki_data_endpoint owns
-	 * non-movable members (libfabric/CUDA handles). */
+	/* Per-rail GDA domains for this comm, shared by every context on it. The
+	 * endpoints and memory registrations below all open on one of these, so this
+	 * is declared first and released last. */
+	std::shared_ptr<nccl_ofi_gdaki_gin_domain_t> gin_domain;                     /* [num_rails]      */
+
+	/* Per-ctx data (main) endpoint: libfabric EP on the GDA domain plus
+	 * its GPU-side SQ buffer/doorbell mappings, GPU-resident QP/CQ
+	 * descriptors, target addressing, and a FI_WRITE hardware counter for
+	 * completion tracking. One per logical context. unique_ptr because
+	 * gdaki_data_endpoint owns non-movable members (libfabric/CUDA handles). */
 	std::vector<std::unique_ptr<gdaki_data_endpoint>> data;                            /* [nContexts]      */
 
 	/* Per-ctx DEDICATED PutValue poster endpoint. PutValue posts only from

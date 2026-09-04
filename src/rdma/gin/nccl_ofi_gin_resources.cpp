@@ -211,7 +211,7 @@ static int set_mr_req_attr(uint64_t mr_key, nccl_ofi_mr_ckey_ref ckey, uint64_t 
 	return ret;
 }
 
-int nccl_ofi_rdma_gin_ep_t::reg_mr(nccl_ofi_mr_ckey_ref ckey, int type,
+int nccl_ofi_gin_domain_t::reg_mr(nccl_ofi_mr_ckey_ref ckey, int type,
 			      nccl_ofi_gin_mr_handle_t **mhandle)
 {
 	int ret = 0;
@@ -224,7 +224,7 @@ int nccl_ofi_rdma_gin_ep_t::reg_mr(nccl_ofi_mr_ckey_ref ckey, int type,
 
 	*mhandle = NULL;
 
-	nccl_ofi_idpool_t *key_pool = this->domain.mr_rkey_pool;
+	nccl_ofi_idpool_t *key_pool = net_domain.mr_rkey_pool;
 	uint64_t mr_key = 0;
 
 	if (key_pool->get_size() != 0) {
@@ -238,19 +238,19 @@ int nccl_ofi_rdma_gin_ep_t::reg_mr(nccl_ofi_mr_ckey_ref ckey, int type,
 	struct fi_mr_attr mr_attr = {};
 	uint64_t regattr_flags = 0;
 	auto ret_handle =
-		std::make_unique<nccl_ofi_gin_mr_handle_t>(this->domain, num_rails, mr_key);
+		std::make_unique<nccl_ofi_gin_mr_handle_t>(net_domain, get_num_rails(), mr_key);
 
 	ret = set_mr_req_attr(ret_handle->mr_key, ckey, &regattr_flags, type, &mr_attr);
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Could not set registration request attributes, dev: %d",
-			      domain.get_device()->dev_id);
+			      net_domain.get_device()->dev_id);
 		return ret;
 	}
 
 	/* Register memory on each rail */
-	for (uint16_t rail_id = 0; rail_id != num_rails; ++rail_id) {
-		auto mr_result = nccl_ofi_ofiutils_mr_regattr(domain.get_ofi_domain(rail_id),
-							      &mr_attr, regattr_flags);
+	for (uint16_t rail_id = 0; rail_id != get_num_rails(); ++rail_id) {
+		auto mr_result = nccl_ofi_ofiutils_mr_regattr(get_ofi_domain(rail_id), &mr_attr,
+							      regattr_flags);
 		if (OFI_UNLIKELY(mr_result.is_failure())) {
 			NCCL_OFI_WARN("Could not register memory on rail %u with flag %lu", rail_id,
 				      regattr_flags);
@@ -263,7 +263,7 @@ int nccl_ofi_rdma_gin_ep_t::reg_mr(nccl_ofi_mr_ckey_ref ckey, int type,
 	return 0;
 }
 
-void nccl_ofi_rdma_gin_ep_t::dereg_mr(nccl_ofi_gin_mr_handle_t *handle_ptr)
+void nccl_ofi_gin_domain_t::dereg_mr(nccl_ofi_gin_mr_handle_t *handle_ptr)
 {
 	if (OFI_UNLIKELY(handle_ptr == NULL)) {
 		NCCL_OFI_WARN("Attempted to deregister NULL memory region handle");
@@ -273,16 +273,17 @@ void nccl_ofi_rdma_gin_ep_t::dereg_mr(nccl_ofi_gin_mr_handle_t *handle_ptr)
 	delete handle_ptr;
 }
 
-int nccl_ofi_rdma_gin_ep_t::freelist_regmr_fn(void *ep_ptr, void *data, size_t size, void **mhandle)
+int nccl_ofi_gin_domain_t::freelist_regmr_fn(void *gin_domain_ptr, void *data, size_t size,
+					     void **mhandle)
 {
-	auto ep = static_cast<nccl_ofi_rdma_gin_ep_t *>(ep_ptr);
+	auto gin_domain = static_cast<nccl_ofi_gin_domain_t *>(gin_domain_ptr);
 	/* Setting ep to nullptr for the cache key -- we don't use the MR cache for GIN */
 	auto ckey = nccl_ofi_mr_ckey_mk_vec(data, size, nullptr);
-	return ep->reg_mr(&ckey, NCCL_PTR_HOST,
-			  reinterpret_cast<nccl_ofi_gin_mr_handle_t **>(mhandle));
+	return gin_domain->reg_mr(&ckey, NCCL_PTR_HOST,
+				  reinterpret_cast<nccl_ofi_gin_mr_handle_t **>(mhandle));
 }
 
-int nccl_ofi_rdma_gin_ep_t::freelist_deregmr_fn(void *handle)
+int nccl_ofi_gin_domain_t::freelist_deregmr_fn(void *handle)
 {
 	auto mr_handle = static_cast<nccl_ofi_gin_mr_handle_t *>(handle);
 
@@ -449,6 +450,7 @@ void nccl_ofi_gin_resources::post_rx_buffs_on_rail(nccl_ofi_gin_ep_rail_t &rail,
 
 nccl_ofi_gin_resources::nccl_ofi_gin_resources(nccl_net_ofi_ep_t &ep_arg)
     : ep_holder(ep_arg.shared_from_this()),
+      gin_domain(ep_arg.get_domain(), ep_arg.get_domain().get_ofi_num_rails()),
       gin_ep(ep_arg.get_domain()),
       dev(ep_arg.get_domain().get_device()->dev_id),
       req_fl(nullptr, &freelist_deleter),
@@ -466,14 +468,16 @@ nccl_ofi_gin_resources::nccl_ofi_gin_resources(nccl_net_ofi_ep_t &ep_arg)
 	nccl_ofi_freelist *rx_buff_fl_tmp = nullptr;
 	rx_buff_fl_tmp = new nccl_ofi_freelist(sizeof(nccl_net_ofi_gin_signal_metadata_msg_t),
 					       num_buffers, 0, num_buffers, nullptr, nullptr,
-					       gin_ep.freelist_regmr_fn, gin_ep.freelist_deregmr_fn,
-					       &gin_ep, 1, "GIN Rx Buffers", true);
+					       nccl_ofi_gin_domain_t::freelist_regmr_fn,
+					       nccl_ofi_gin_domain_t::freelist_deregmr_fn,
+					       &gin_domain, 1, "GIN Rx Buffers", true);
 	this->rx_buff_fl.reset(rx_buff_fl_tmp);
 
 	/* Create freelist for ACK send buffers */
 	this->ack_send_fl.reset(new nccl_ofi_freelist(sizeof(gin_ack_msg_t), 64, 64, 0, nullptr,
-						      nullptr, gin_ep.freelist_regmr_fn,
-						      gin_ep.freelist_deregmr_fn, &gin_ep, 1,
+						      nullptr, nccl_ofi_gin_domain_t::freelist_regmr_fn,
+						      nccl_ofi_gin_domain_t::freelist_deregmr_fn,
+						      &gin_domain, 1,
 						      "GIN ACK Send", true));
 
 	/* Create the receive pool for all rails */
@@ -496,9 +500,9 @@ void nccl_ofi_gin_resources::init_flush_buffers(uint16_t num_rails)
 	size_t flush_buff_size = NCCL_OFI_DEFAULT_CPU_CACHE_LINE_SIZE * num_rails;
 
 	auto cleanup = [&]() {
-		if (flush_buff_gpu_mr_handle) { gin_ep.dereg_mr(flush_buff_gpu_mr_handle); flush_buff_gpu_mr_handle = nullptr; }
+		if (flush_buff_gpu_mr_handle) { gin_domain.dereg_mr(flush_buff_gpu_mr_handle); flush_buff_gpu_mr_handle = nullptr; }
 		if (flush_buff_gpu) { nccl_net_ofi_gpu_mem_free(flush_buff_gpu); flush_buff_gpu = nullptr; }
-		if (flush_buff_mr_handle) { gin_ep.dereg_mr(flush_buff_mr_handle); flush_buff_mr_handle = nullptr; }
+		if (flush_buff_mr_handle) { gin_domain.dereg_mr(flush_buff_mr_handle); flush_buff_mr_handle = nullptr; }
 		if (flush_buff) { std::free(flush_buff); flush_buff = nullptr; }
 	};
 
@@ -509,7 +513,7 @@ void nccl_ofi_gin_resources::init_flush_buffers(uint16_t num_rails)
 
 	try {
 		auto ckey = nccl_ofi_mr_ckey_mk_vec(flush_buff, flush_buff_size, nullptr);
-		if (gin_ep.reg_mr(&ckey, NCCL_PTR_HOST, &flush_buff_mr_handle) != 0) {
+		if (gin_domain.reg_mr(&ckey, NCCL_PTR_HOST, &flush_buff_mr_handle) != 0) {
 			throw std::runtime_error("Failed to register flush buffer");
 		}
 
@@ -518,7 +522,7 @@ void nccl_ofi_gin_resources::init_flush_buffers(uint16_t num_rails)
 		}
 
 		auto gpu_ckey = nccl_ofi_mr_ckey_mk_vec(flush_buff_gpu, flush_buff_size, nullptr);
-		if (gin_ep.reg_mr(&gpu_ckey, NCCL_PTR_CUDA, &flush_buff_gpu_mr_handle) != 0) {
+		if (gin_domain.reg_mr(&gpu_ckey, NCCL_PTR_CUDA, &flush_buff_gpu_mr_handle) != 0) {
 			throw std::runtime_error("Failed to register GPU flush buffer");
 		}
 
@@ -546,7 +550,7 @@ nccl_ofi_gin_resources::~nccl_ofi_gin_resources()
 {
 	/* Deregister and free flush buffer before closing endpoints */
 	if (flush_buff_gpu_mr_handle) {
-		gin_ep.dereg_mr(flush_buff_gpu_mr_handle);
+		gin_domain.dereg_mr(flush_buff_gpu_mr_handle);
 		flush_buff_gpu_mr_handle = nullptr;
 	}
 	if (flush_buff_gpu) {
@@ -554,7 +558,7 @@ nccl_ofi_gin_resources::~nccl_ofi_gin_resources()
 		flush_buff_gpu = nullptr;
 	}
 	if (flush_buff_mr_handle) {
-		gin_ep.dereg_mr(flush_buff_mr_handle);
+		gin_domain.dereg_mr(flush_buff_mr_handle);
 		flush_buff_mr_handle = nullptr;
 	}
 	if (flush_buff) {

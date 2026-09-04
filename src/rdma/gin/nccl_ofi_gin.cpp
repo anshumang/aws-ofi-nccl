@@ -51,7 +51,9 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(nccl_ofi_gin_resources &r
 	nccl_ofi_freelist *metadata_fl_ptr = nullptr;
 	metadata_fl_ptr = new nccl_ofi_freelist(
 		sizeof(nccl_net_ofi_gin_signal_metadata_msg_t), 16, 16, 0, nullptr, nullptr,
-		ep.freelist_regmr_fn, ep.freelist_deregmr_fn, &ep, 1, "GIN Metadata", true);
+		nccl_ofi_gin_domain_t::freelist_regmr_fn,
+		nccl_ofi_gin_domain_t::freelist_deregmr_fn, &resources.get_gin_domain(), 1,
+		"GIN Metadata", true);
 
 	metadata_fl.reset(metadata_fl_ptr);
 
@@ -322,7 +324,8 @@ int nccl_ofi_rdma_gin_put_comm::regMrSymDmaBuf(nccl_ofi_mr_ckey_ref ckey, void *
 	/* Shared core: dedup/refcount, local EFA registration, MR-map insert,
 	   per-rank key all-gather. */
 	nccl_ofi_rdma_gin_symm_mr_handle *mr_handle = nullptr;
-	int ret = regMrSymDmaBufCommon(ckey, data_ptr, size, type, &mr_handle);
+	int ret = regMrSymDmaBufCommon(ckey, data_ptr, size, type, resources.get_gin_domain(),
+				       &mr_handle);
 	if (ret != 0) {
 		return ret;
 	}
@@ -347,9 +350,13 @@ int nccl_ofi_rdma_gin_put_comm::regMrSymDmaBuf(nccl_ofi_mr_ckey_ref ckey, void *
 }
 
 int nccl_ofi_rdma_gin_put_comm::regMrSymLocal(nccl_ofi_mr_ckey_ref ckey, void *data_ptr, size_t size,
-				      int type, nccl_ofi_rdma_gin_symm_mr_handle **mr_handle_out)
+				      int type, nccl_ofi_gin_domain_t &reg_domain,
+				      nccl_ofi_rdma_gin_symm_mr_handle **mr_handle_out)
 {
-	auto &gin_ep = resources.get_ep();
+	/* Peers address this region over this comm's endpoints, so reg_domain covers
+	 * at most the rails those endpoints span. */
+	assert(reg_domain.get_num_rails() > 0 &&
+	       reg_domain.get_num_rails() <= resources.get_ep().get_num_rails());
 
 	auto *mr_handle = new nccl_ofi_rdma_gin_symm_mr_handle {};
 
@@ -359,7 +366,7 @@ int nccl_ofi_rdma_gin_put_comm::regMrSymLocal(nccl_ofi_mr_ckey_ref ckey, void *d
 	/**
 	 * Local registration with the endpoint
 	 */
-	int ret = gin_ep.reg_mr(ckey, type, &mr_handle->local_handle);
+	int ret = reg_domain.reg_mr(ckey, type, &mr_handle->local_handle);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Local endpoint memory registration failed: %d", ret);
 		delete mr_handle;
@@ -381,10 +388,12 @@ int nccl_ofi_rdma_gin_put_comm::regMrSymLocal(nccl_ofi_mr_ckey_ref ckey, void *d
 	} else {
 		my_remote_mr.address_offset = 0;
 	}
-	my_remote_mr.num_rails = gin_ep.get_num_rails();
+	/* The rails reg_domain registered on, which is what the peers need to address
+	 * this region. */
+	my_remote_mr.num_rails = reg_domain.get_num_rails();
 
 	auto *local_handle = mr_handle->local_handle;
-	for (unsigned i = 0; i < gin_ep.get_num_rails(); ++i) {
+	for (unsigned i = 0; i < reg_domain.get_num_rails(); ++i) {
 		my_remote_mr.mr_key[i] = fi_mr_key(local_handle->get_mr(i));
 		if (my_remote_mr.mr_key[i] == FI_KEY_NOTAVAIL) {
 			NCCL_OFI_WARN("Memory registration key is not available");
@@ -398,7 +407,8 @@ int nccl_ofi_rdma_gin_put_comm::regMrSymLocal(nccl_ofi_mr_ckey_ref ckey, void *d
 }
 
 int nccl_ofi_rdma_gin_put_comm::regMrSymDmaBufCommon(nccl_ofi_mr_ckey_ref ckey, void *data_ptr, size_t size,
-				      int type, nccl_ofi_rdma_gin_symm_mr_handle **mr_handle_out)
+				      int type, nccl_ofi_gin_domain_t &reg_domain,
+				      nccl_ofi_rdma_gin_symm_mr_handle **mr_handle_out)
 {
 	nccl_ofi_rdma_gin_symm_mr_handle *mr_handle = nullptr;
 	int ret = 0;
@@ -417,7 +427,7 @@ int nccl_ofi_rdma_gin_put_comm::regMrSymDmaBufCommon(nccl_ofi_mr_ckey_ref ckey, 
 		it->second.refcnt++;
 		mr_handle = it->second.handle;
 	} else {
-		ret = regMrSymLocal(ckey, data_ptr, size, type, &mr_handle);
+		ret = regMrSymLocal(ckey, data_ptr, size, type, reg_domain, &mr_handle);
 		if (ret != 0) {
 			return ret;
 		}
