@@ -30,11 +30,6 @@
 extern "C" {
 #endif
 
-/* Per-slot stride (bytes) of the PutValue source pool. PutValue's T
- * is asserted by the kernel template to be <= 8 bytes; using 8 lets
- * any T fit in one slot regardless of alignment. */
-#define NCCL_OFI_GDAKI_PUTVALUE_SLOT_SIZE 8
-
 /**
  * Per-peer MR metadata used by EFA GDA WQE construction.
  *
@@ -203,12 +198,10 @@ struct nccl_ofi_gin_gdaki_dev_endpoint_handle {
 	 * <= sq_size before reserving slots. */
 	uint32_t sq_size;
 
-	uint32_t putvalue_pad;
-
-	/* Base of the PutValue source-slot pool; used only by the dedicated
-	 * PutValue endpoint (dev_handle.pvdata). Holds sq_size slots; the device
-	 * stages into slot (SQ_reservation_index % sq_size) * putvalue_slot_size. */
-	uint64_t putvalue_slice_base;
+	/* Preserve the established device-handle layout while NCCL
+	 * mirrors compiled against the earlier layout still carry the removed
+	 * PutValue staging-pool fields. */
+	uint32_t reserved[3];
 };
 
 /**
@@ -293,12 +286,12 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 
 	/* Multi-rail: the rail (EFA NIC) this logical context is bound to.
 	 * The plugin opens this context's endpoints on rail rail_id's
-	 * domain and bakes that rail's scratch / putvalue lkeys (and the
-	 * peers' per-rail rkeys) into this handle. The kernel uses rail_id
-	 * only to index the per-rail mr_handle array regMrSym returns as
-	 * the window; every endpoint / scratch / putvalue field here is
-	 * already rail-resolved. rail_id = contextId % num_rails. Mirror
-	 * of the NCCL-side field. */
+	 * domain and bakes that rail's scratch lkey (and the peers'
+	 * per-rail rkeys) into this handle. The kernel uses rail_id only
+	 * to index the per-rail mr_handle array regMrSym returns as the
+	 * window; every endpoint and scratch field here is already
+	 * rail-resolved. rail_id = contextId % num_rails. Mirror of the
+	 * NCCL-side field. */
 	uint32_t rail_id;
 
 	/* Signal-only scratch buffer support.
@@ -327,17 +320,10 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 	/* Per-peer remote scratch rkeys, indexed by rank. [nranks] in GPU mem. */
 	uint32_t *scratch_remote_rkeys;
 
-	/* PutValue source slot pool for the dedicated pvdata endpoint. PutValue
-	 * stages srcVal through a registered local slot, then RDMA-writes it to
-	 * the user's destination; the write arrives on the peer's target endpoint
-	 * chosen by the signal (sc EP for a signalled PutValue, data EP for
-	 * no-signal), bumping FI_REMOTE_WRITE where applicable.
-	 *
-	 * The pool holds pvdata.sq_size slots. Slot stride is uniform
-	 * (== NCCL_OFI_GDAKI_PUTVALUE_SLOT_SIZE, the max sizeof(T) PutValue
-	 * accepts); pool base lives on pvdata.putvalue_slice_base. */
-	uint32_t putvalue_lkey;
-	uint32_t putvalue_slot_size;
+	/* Preserve the established device-handle size while NCCL
+	 * mirrors compiled against the earlier layout still carry the removed
+	 * PutValue staging-pool fields. */
+	uint32_t reserved[2];
 };
 
 #ifdef __cplusplus
