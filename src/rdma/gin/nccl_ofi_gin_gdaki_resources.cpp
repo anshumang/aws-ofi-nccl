@@ -134,8 +134,6 @@ static struct fi_info *get_gdaki_info(struct fi_info *ref_info)
 	int ret = fi_getinfo(FI_VERSION(2, 5), nullptr, nullptr, 0ULL,
 			     hints, &results);
 	fi_freeinfo(hints);
-	if (ret == 0 && results != nullptr) {
-		}
 	if (ret != 0) {
 		throw std::runtime_error("fi_getinfo for GDAKI info failed: " +
 					 std::string(fi_strerror(-ret)));
@@ -218,10 +216,10 @@ void nccl_ofi_gdaki_gin_domain_t::open_rail(uint16_t rail_id, int dev_id)
 
 void gdaki_fi_endpoint::open(struct fid_domain *domain,
 			     struct fi_info *ref_info,
-			     struct fid_cq *cq,
+			     struct fid_cq *shared_cq,
 			     uint32_t inline_write_size)
 {
-	if (ep || av || info) {
+	if (ep || cq || av || info) {
 		throw std::runtime_error("gdaki_fi_endpoint: double open");
 	}
 
@@ -243,9 +241,24 @@ void gdaki_fi_endpoint::open(struct fid_domain *domain,
 		info->tx_attr->size /= 2;
 	}
 
+	int ret;
+	if (shared_cq != nullptr) {
+		cq = shared_cq;
+	} else {
+		struct fi_cq_attr cq_attr = {};
+		cq_attr.format = FI_CQ_FORMAT_DATA;
+		cq_attr.size = ofi_nccl_cq_size();
+		ret = fi_cq_open(domain, &cq_attr, &cq, nullptr);
+		if (ret != 0) {
+			throw std::runtime_error("fi_cq_open for backendVersion 1 failed: " +
+						 std::string(fi_strerror(-ret)));
+		}
+		owns_cq = true;
+	}
+
 	struct fi_av_attr av_attr = {};
 	av_attr.type = FI_AV_TABLE;
-	int ret = fi_av_open(domain, &av_attr, &av, nullptr);
+	ret = fi_av_open(domain, &av_attr, &av, nullptr);
 	if (ret != 0) {
 		throw std::runtime_error("fi_av_open on proxy domain failed: " +
 					 std::string(fi_strerror(-ret)));
@@ -257,7 +270,6 @@ void gdaki_fi_endpoint::open(struct fid_domain *domain,
 					 std::string(fi_strerror(-ret)));
 	}
 
-	/* Bind the borrowed cq; the caller owns and closes it. */
 	ret = fi_ep_bind(ep, &cq->fid, FI_TRANSMIT | FI_RECV);
 	if (ret != 0) {
 		throw std::runtime_error("fi_ep_bind CQ failed: " +
@@ -318,13 +330,8 @@ void gdaki_gpu_qp::build(int backend_version_in,
 		 * WQE geometry reported in sq_attr. */
 		attrs.sq_max_inline_data = sq_max_inline_data;
 		attrs.sq_max_rdma_sges = gdaki_max_rdma_sges;
-		/*
-		 * efa-dp-direct v1 writes 64-bit request IDs. NCCL uses the
-		 * FI_WRITE hardware counter for progress and never decodes a
-		 * transmit CQE request ID; its generated IDs also fit in the
-		 * low 16 bits. This keeps the upstream v1 layout on both narrow
-		 * and wide QPs without carrying a private narrow-WQE fallback.
-		 */
+		/* gdaki_endpoint::populate verified that the provider QP supports
+		 * the 64-bit request IDs used by host completion polling. */
 		attrs.sq_caps = EFA_CUDA_WQ_CAPS_64_BIT_REQ_ID;
 		break;
 	default:
@@ -352,6 +359,42 @@ void gdaki_gpu_qp::build(int backend_version_in,
 
 	dev_qp = reinterpret_cast<nccl_ofi_gin_gdaki_dev_qp *>(qp.dev);
 	backend_version = backend_version_in;
+}
+
+void gdaki_gpu_cq::build(int backend_version, const struct fi_efa_cq_attr &cq_attr)
+{
+	if (descriptor.size() != 0) {
+		throw std::runtime_error("gdaki_gpu_cq: double build");
+	}
+	if (backend_version != NCCL_OFI_GDAKI_BACKEND_VERSION_1) {
+		throw std::runtime_error("gdaki_gpu_cq: only backendVersion 1 has a GPU CQ");
+	}
+
+	auto ctx = gdaki_create_efa_dp_context(backend_version);
+	const int descriptor_size = efa_cuda_get_cq_size(ctx.get());
+	if (descriptor_size <= 0) {
+		throw std::runtime_error("gdaki_gpu_cq: efa_cuda_get_cq_size failed: " +
+					 std::to_string(descriptor_size));
+	}
+
+	efa_cuda_cq_attrs attrs = {};
+	attrs.buffer = static_cast<uint8_t *>(cq_attr.buffer);
+	attrs.num_entries = cq_attr.num_entries;
+	attrs.entry_size = cq_attr.entry_size;
+
+	descriptor.allocate(static_cast<size_t>(descriptor_size));
+	const int ret = efa_cuda_init_cq(ctx.get(),
+					 descriptor.host,
+					 static_cast<uint32_t>(descriptor_size),
+					 &attrs,
+					 sizeof(attrs));
+	if (ret != 0) {
+		throw std::runtime_error("gdaki_gpu_cq: efa_cuda_init_cq failed: " +
+					 std::to_string(ret));
+	}
+	descriptor.commit();
+
+	cq = reinterpret_cast<nccl_ofi_gin_gdaki_dev_cq *>(descriptor.dev);
 }
 
 void gdaki_host_cq::open(struct fid_domain *domain, size_t cq_size)
@@ -483,10 +526,10 @@ void gdaki_target_addressing::populate(gdaki_fi_endpoint &endpoint,
 
 void gdaki_endpoint::open(struct fid_domain *domain,
 			  struct fi_info *ref_info,
-			  struct fid_cq *cq,
+			  struct fid_cq *shared_cq,
 			  uint32_t inline_write_size)
 {
-	endpoint.open(domain, ref_info, cq, inline_write_size);
+	endpoint.open(domain, ref_info, shared_cq, inline_write_size);
 	endpoint.enable();
 }
 
@@ -527,6 +570,16 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 	 * via base.sq_size. entry_size is kept for createContext's log line. */
 	sq_size = sq_attr.num_entries;
 	sq_entry_size = sq_attr.entry_size;
+
+	if (backend_version == NCCL_OFI_GDAKI_BACKEND_VERSION_1) {
+		struct fi_efa_cq_attr cq_attr = {};
+		ret = gda_ops->query_cq(endpoint.cq, &cq_attr);
+		if (ret != 0) {
+			throw std::runtime_error("gdaki_endpoint query_cq failed: " +
+						 std::string(fi_strerror(-ret)));
+		}
+		gpu_cq.build(backend_version, cq_attr);
+	}
 
 	/* Build the [total_slots*nranks] target table in GPU memory. */
 	targets.populate(endpoint, all_addrs, ep_addr_len, total_slots, nranks, gda_ops);
@@ -570,7 +623,7 @@ void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info
 	write_cntr.create(gda_ops, domain);
 	remote_write_cntr.create(gda_ops, domain);
 
-	/* Open the inner endpoint on the context's shared CQ, without enable. */
+	/* Bind the v2 shared CQ or create the v1 private CQ, without enable. */
 	base.endpoint.open(domain, ref_info, cq, /* inline_write_size */ 0);
 
 	/* Bind counters before enabling. */
@@ -590,42 +643,56 @@ void gdaki_sc_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda
 	/* Per-QP completion is this endpoint's FI_WRITE NIC counter (same as data). */
 	base.completed_count_dev = write_cntr.gpu_ptr();
 
-	/*
-	 * Build the two device handles. They share QP / CQ / target addressing /
-	 * sq_size / submitted_count / local_cntr_value layout — only cntr_value
-	 * differs. Per-QP completion is the FI_WRITE counter (local_cntr_value); the
-	 * counters below are the user-facing counter/signal values the kernel reads.
-	 *
-	 * - counter_dev_handle exposes the FI_WRITE counter via cntr_value (local
-	 *   write count). Returned to the kernel through counter_handles[].
-	 * - signal_dev_handle exposes the FI_REMOTE_WRITE counter via cntr_value
-	 *   (signal arrivals). Returned to the kernel through signal_handles[].
-	 *
-	 * All pointers are set on the host before commit() pushes the struct to GPU
-	 * memory.
-	 */
-	auto fill_common = [&](nccl_ofi_gin_gdaki_dev_counter_handle &h) {
+	if (backend_version == NCCL_OFI_GDAKI_BACKEND_VERSION_1) {
+		auto fill_common = [&](nccl_ofi_gin_gdaki_dev_counter_handle_v1 &h) {
+			h.base.qp = base.gpu_qp.dev();
+			h.base.cq = base.gpu_cq.dev();
+			h.base.target_address_handles = base.targets.ahs.dev;
+			h.base.target_remote_qpns = base.targets.qpns.dev;
+			h.base.target_qkey = base.targets.qkeys.dev;
+			h.base.sq_lock = 0;
+			h.base.local_cntr_value = base.completed_count_dev;
+			h.base.submitted_count = 0;
+			h.base.sq_size = base.sq_size;
+			h.base.putvalue_pad = 0;
+			h.base.putvalue_slice_base = 0;
+			h.cntr_offset = 0;
+		};
+
+		counter_dev_handle_v1.allocate(1);
+		fill_common(counter_dev_handle_v1.host[0]);
+		counter_dev_handle_v1.host[0].cntr_value = write_cntr.gpu_ptr();
+		counter_dev_handle_v1.commit();
+
+		signal_dev_handle_v1.allocate(1);
+		fill_common(signal_dev_handle_v1.host[0]);
+		signal_dev_handle_v1.host[0].cntr_value = remote_write_cntr.gpu_ptr();
+		signal_dev_handle_v1.commit();
+		return;
+	}
+
+	auto fill_common = [&](nccl_ofi_gin_gdaki_dev_counter_handle_v2 &h) {
 		h.base.qp = base.gpu_qp.dev();
 		h.base.target_address_handles = base.targets.ahs.dev;
 		h.base.target_remote_qpns = base.targets.qpns.dev;
 		h.base.target_qkey = base.targets.qkeys.dev;
-		h.base.submitted_count = 0;
 		h.base.local_cntr_value = base.completed_count_dev;
+		h.base.submitted_count = 0;
 		h.base.sq_size = base.sq_size;
-		h.cntr_offset = 0;   /* offset-based reset baseline */
+		h.base.putvalue_pad = 0;
+		h.base.putvalue_slice_base = 0;
+		h.cntr_offset = 0;
 	};
 
-	counter_dev_handle.allocate(1);
-	fill_common(counter_dev_handle.host[0]);
-	/* TODO: Refactor counter_dev_handle so the same gpu memory is not
-	 * being used by multiple fields */
-	counter_dev_handle.host[0].cntr_value = write_cntr.gpu_ptr();
-	counter_dev_handle.commit();
+	counter_dev_handle_v2.allocate(1);
+	fill_common(counter_dev_handle_v2.host[0]);
+	counter_dev_handle_v2.host[0].cntr_value = write_cntr.gpu_ptr();
+	counter_dev_handle_v2.commit();
 
-	signal_dev_handle.allocate(1);
-	fill_common(signal_dev_handle.host[0]);
-	signal_dev_handle.host[0].cntr_value = remote_write_cntr.gpu_ptr();
-	signal_dev_handle.commit();
+	signal_dev_handle_v2.allocate(1);
+	fill_common(signal_dev_handle_v2.host[0]);
+	signal_dev_handle_v2.host[0].cntr_value = remote_write_cntr.gpu_ptr();
+	signal_dev_handle_v2.commit();
 }
 
 gdaki_completion_state::~gdaki_completion_state()

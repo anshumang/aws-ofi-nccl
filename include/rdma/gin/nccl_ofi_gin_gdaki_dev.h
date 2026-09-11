@@ -24,6 +24,7 @@
 #ifndef NCCL_OFI_GIN_GDAKI_DEV_H_
 #define NCCL_OFI_GIN_GDAKI_DEV_H_
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -121,7 +122,8 @@ struct nccl_ofi_gin_gdaki_mr_handle {
  * something to fall back from. */
 #define NCCL_OFI_GDAKI_BACKEND_VERSION_UNSET (-1)
 
-/* Deliberately incomplete: see the note on qp/cq below. */
+/* Deliberately incomplete: the selected backendVersion defines the pointee
+ * layout. */
 struct nccl_ofi_gin_gdaki_dev_qp;
 struct nccl_ofi_gin_gdaki_dev_cq;
 
@@ -150,232 +152,98 @@ struct nccl_ofi_gin_gdaki_dev_cq;
 #define NCCL_OFI_GDAKI_PEER_BITS_WORDS (NCCL_OFI_GDAKI_PEER_WINDOW / 64u)
 
 
-/**
- * Common per-endpoint state shared by the data, counter, and signal
- * device handles. Holds the GPU-resident QP, the target addressing
- * table, and the per-QP submitted and completed counts.
- * Used directly as the `data` member of nccl_ofi_gin_gdaki_dev_handle,
- * and embedded as a `base` member in nccl_ofi_gin_gdaki_dev_counter_handle.
+/*
+ * The device ABI is versioned as a whole, including the endpoint and
+ * counter-handle layouts embedded in the top-level handle.
  *
- * Layout is shared with the NCCL mirror in
- * nccl_device/gin/efa_gda/gin_efa_gda_dev.h — keep them in sync.
+ * v1 is the NCCL 2.31 layout. Each endpoint exposes a device-visible CQ and
+ * lock, and PutValue stages through a registered source-slot pool.
+ *
+ * v2 is the NCCL 2.32 layout. CQs are drained by the plugin, the lock is part
+ * of the efa-dp-direct QP descriptor, and the top-level handle carries the
+ * host-published completion state used by FlushAsync/Wait.
  */
-struct nccl_ofi_gin_gdaki_dev_endpoint_handle {
-	/* GPU-resident QP for this endpoint, in the layout named by the
-	 * context's backendVersion. */
+
+struct nccl_ofi_gin_gdaki_dev_endpoint_handle_v1 {
 	struct nccl_ofi_gin_gdaki_dev_qp *qp;
-
-	/* Target addressing for this (poster) endpoint's QP.
-	 *
-	 * One GPU-resident table, sized [total_slots * nranks] and laid out
-	 * targetSlot-major: idx = targetSlot * nranks + peer, where
-	 *     targetSlot 0       -> peer's DATA endpoint
-	 *     targetSlot 1 + s   -> peer's sc endpoint s (signal id s)
-	 * and total_slots = 1 + (max over peers of their sc-endpoint count).
-	 *
-	 * The device side selects the slot per write:
-	 *     plain put / counter-only write -> slot 0 (peer data EP, which
-	 *       binds no FI_REMOTE_WRITE, so the write ticks the local
-	 *       FI_WRITE counter without firing a signal on the receiver)
-	 *     signalling write (signal id s) -> slot 1 + s (peer sc EP s,
-	 *       whose FI_REMOTE_WRITE counter the GIN waitSignal observes)
-	 * The local poster QP is chosen by counterId (which endpoint owns
-	 * this handle); the remote target QP is chosen by the slot.
-	 *
-	 * Every (slot, peer) tuple is resolved through THIS endpoint's own
-	 * AV (an address handle is AV-local), so the data endpoint and every
-	 * sc endpoint each carry their own table. A (slot, peer) a peer does
-	 * not expose (asymmetric counts) is a zero entry, never addressed (a
-	 * correct caller never directs a signalId at a peer that did not
-	 * create it).
-	 *
-	 * Layout is shared with the NCCL mirror in
-	 * nccl_device/gin/efa_gda/gin_efa_gda_dev.h — keep them in sync. */
-	uint16_t *target_address_handles;   /* [total_slots * nranks] */
-	uint16_t *target_remote_qpns;       /* [total_slots * nranks] */
-	uint32_t *target_qkey;              /* [total_slots * nranks] */
-
-	/* Per-QP completed count for this QP: the endpoint's FI_WRITE NIC counter,
-	 * read directly from GPU memory. One increment per write completion.
-	 * Sufficient for ring reuse because the NIC consumes WQEs in order and a
-	 * completion implies its WQE was consumed. Wraps at 2^31 (compared under
-	 * EFA_CNTR_MASK). The blocking peer-less Flush reads it. */
+	struct nccl_ofi_gin_gdaki_dev_cq *cq;
+	uint16_t *target_address_handles;
+	uint16_t *target_remote_qpns;
+	uint32_t *target_qkey;
+	uint32_t sq_lock;
 	volatile uint64_t *local_cntr_value;
-
-	/* `submitted_count` is incremented in ringDoorbell (an atomic add of the
-	 * newly-doorbelled span, by the group leader). The difference (submitted_count
-	 * - *local_cntr_value) is the number of WRs still in flight on this QP, used
-	 * by Flush. */
 	uint64_t submitted_count;
-
-	/* SQ ring size for this endpoint's QP. The device-side Put uses it to gate
-	 * new batches against in-flight WRs: the kernel spins until
-	 * (submitted_count - *completed_count + batch_size) <= sq_size before
-	 * reserving slots. */
 	uint32_t sq_size;
-
 	uint32_t putvalue_pad;
-
-	/* Base of the PutValue source-slot pool; used only by the dedicated
-	 * PutValue endpoint (dev_handle.pvdata). Holds sq_size slots; the device
-	 * stages into slot (SQ_reservation_index % sq_size) * putvalue_slot_size. */
 	uint64_t putvalue_slice_base;
 };
 
-/**
- * Per-signal/counter endpoint handle, visible to device code.
- *
- * Composes nccl_ofi_gin_gdaki_dev_endpoint_handle (qp / addressing /
- * counter completion tracking) and adds the hardware counter
- * value pointer that the kernel reads to observe signal arrivals
- * (FI_REMOTE_WRITE) or counter increments (FI_WRITE). The hardware
- * counter value lives in GPU memory and is updated by the NIC directly.
- *
- * For signals: the GPU kernel reads *cntr_value to detect remote writes
- *              (FI_REMOTE_WRITE counter). The target table lets
- *              the sender target this QP on the remote rank.
- *
- * For counters: the GPU kernel reads *cntr_value to track local write
- *               completions (FI_WRITE counter). The QP is used by the
- *               local rank to post writes that need completion tracking.
- *
- * Layout is shared with the NCCL mirror in
- * nccl_device/gin/efa_gda/gin_efa_gda_dev.h — keep them in sync.
- */
-struct nccl_ofi_gin_gdaki_dev_counter_handle {
-	/* Endpoint-common fields (qp, addressing,
-	 * counter completion tracking). */
-	struct nccl_ofi_gin_gdaki_dev_endpoint_handle base;
+struct nccl_ofi_gin_gdaki_dev_endpoint_handle_v2 {
+	struct nccl_ofi_gin_gdaki_dev_qp *qp;
+	uint16_t *target_address_handles;
+	uint16_t *target_remote_qpns;
+	uint32_t *target_qkey;
+	volatile uint64_t *local_cntr_value;
+	uint64_t submitted_count;
+	uint32_t sq_size;
 
-	/* Pointer to the hardware counter value in GPU-accessible memory.
-	 * For signals: FI_REMOTE_WRITE count. For counters: FI_WRITE count. */
+	uint32_t putvalue_pad;
+	uint64_t putvalue_slice_base;
+};
+
+struct nccl_ofi_gin_gdaki_dev_counter_handle_v1 {
+	struct nccl_ofi_gin_gdaki_dev_endpoint_handle_v1 base;
 	volatile uint64_t *cntr_value;
-
-	/* Reset baseline for offset-based (reset-without-zeroing) semantics.
-	 * The NIC counter cannot be written by software, so ResetSignal /
-	 * ResetCounter snapshot the current cntr_value into cntr_offset
-	 * instead of zeroing the counter. Reads/waits subtract cntr_offset,
-	 * making the signal/counter appear reset without modifying the
-	 * NIC-visible value. Initialized to 0 at populate() time. */
 	uint64_t cntr_offset;
 };
 
-/**
- * Device-visible handle returned from createContext.
- *
- * This struct is allocated in GPU memory. The pointer is stored in
- * ncclNetDeviceHandle_v11_t::handle and passed to device code, which
- * dereferences it directly on the GPU.
- *
- * All member pointers refer to GPU-accessible memory.
- */
-struct nccl_ofi_gin_gdaki_dev_handle {
-	/* Data endpoint (qp / addressing / submitted_count /
-	 * completed_count / sq_size). Per-QP completion is its FI_WRITE NIC counter
-	 * (completed_count). */
-	struct nccl_ofi_gin_gdaki_dev_endpoint_handle data;
+struct nccl_ofi_gin_gdaki_dev_counter_handle_v2 {
+	struct nccl_ofi_gin_gdaki_dev_endpoint_handle_v2 base;
+	volatile uint64_t *cntr_value;
+	uint64_t cntr_offset;
+};
 
-	/* Dedicated PutValue endpoint (same fields as data). All PutValues post from
-	 * here; per-QP completion is its own FI_WRITE NIC counter. */
-	struct nccl_ofi_gin_gdaki_dev_endpoint_handle pvdata;
-
-	/* Per-counter device handle array, [nCounters]. NULL when nCounters == 0. */
-	struct nccl_ofi_gin_gdaki_dev_counter_handle **counter_handles;
-
-	/* Per-signal device handle array, [nSignals]. NULL when nSignals == 0. */
-	struct nccl_ofi_gin_gdaki_dev_counter_handle **signal_handles;
-
-	/* Number of counter_handles entries. 0 means counter_handles is NULL. */
+struct nccl_ofi_gin_gdaki_dev_handle_v1 {
+	struct nccl_ofi_gin_gdaki_dev_endpoint_handle_v1 data;
+	struct nccl_ofi_gin_gdaki_dev_endpoint_handle_v1 pvdata;
+	struct nccl_ofi_gin_gdaki_dev_counter_handle_v1 **counter_handles;
+	struct nccl_ofi_gin_gdaki_dev_counter_handle_v1 **signal_handles;
 	int32_t nCounters;
-
-	/* Number of signal_handles entries. 0 means signal_handles is NULL. */
 	int32_t nSignals;
-
-	/* Number of ranks participating in this context. */
 	int32_t nranks;
-
-	/* Rank of the local process within the context. */
 	int32_t rank;
-
-	/* Multi-rail: the rail (EFA NIC) this logical context is bound to.
-	 * The plugin opens this context's endpoints on rail rail_id's
-	 * domain and bakes that rail's scratch / putvalue lkeys (and the
-	 * peers' per-rail rkeys) into this handle. The kernel uses rail_id
-	 * only to index the per-rail mr_handle array regMrSym returns as
-	 * the window; every endpoint / scratch / putvalue field here is
-	 * already rail-resolved. rail_id = contextId % num_rails. Mirror
-	 * of the NCCL-side field. */
 	uint32_t rail_id;
-
-	/* Signal-only scratch buffer support.
-	 *
-	 * net.signal(team, peer, ...) (used by ncclBarrierSession) routes
-	 * through ncclGinApi_Put with hasWins=false, bytes=0. EFA needs an
-	 * actual remote memory destination to bump the receiver's
-	 * FI_REMOTE_WRITE counter on the signal endpoint, so the plugin
-	 * allocates a small buffer per createContext, registers it on the
-	 * proxy domain, and allgathers the (local_addr, rkey) per rank. The
-	 * GPU kernel uses these to post a 4-byte RDMA write to the peer's
-	 * scratch region whenever it needs a signal-only delivery. The
-	 * buffer content is never read — only the RDMA write event itself
-	 * increments the receiver's FI_REMOTE_WRITE counter.
-	 */
-	/* Local lkey for the scratch buffer on the proxy domain. */
 	uint32_t scratch_lkey;
 	uint32_t scratch_pad;
-
-	/* Local source address for scratch writes (this rank's scratch). */
 	uint64_t scratch_local_addr;
-
-	/* Per-peer remote scratch base addresses, indexed by rank. [nranks] in GPU mem. */
 	uint64_t *scratch_remote_addrs;
+	uint32_t *scratch_remote_rkeys;
+	uint32_t putvalue_lkey;
+	uint32_t putvalue_slot_size;
+};
 
-	/* Per-peer remote scratch rkeys, indexed by rank. [nranks] in GPU mem. */
+struct nccl_ofi_gin_gdaki_dev_handle_v2 {
+	struct nccl_ofi_gin_gdaki_dev_endpoint_handle_v2 data;
+	struct nccl_ofi_gin_gdaki_dev_endpoint_handle_v2 pvdata;
+	struct nccl_ofi_gin_gdaki_dev_counter_handle_v2 **counter_handles;
+	struct nccl_ofi_gin_gdaki_dev_counter_handle_v2 **signal_handles;
+	int32_t nCounters;
+	int32_t nSignals;
+	int32_t nranks;
+	int32_t rank;
+	uint32_t rail_id;
+	uint32_t scratch_lkey;
+	uint32_t scratch_pad;
+	uint64_t scratch_local_addr;
+	uint64_t *scratch_remote_addrs;
 	uint32_t *scratch_remote_rkeys;
 
-	/* PutValue source slot pool for the dedicated pvdata endpoint. PutValue
-	 * stages srcVal through a registered local slot, then RDMA-writes it to
-	 * the user's destination; the write arrives on the peer's target endpoint
-	 * chosen by the signal (sc EP for a signalled PutValue, data EP for
-	 * no-signal), bumping FI_REMOTE_WRITE where applicable.
-	 *
-	 * The pool holds pvdata.sq_size slots. Slot stride is uniform
-	 * (== NCCL_OFI_GDAKI_PUTVALUE_SLOT_SIZE, the max sizeof(T) PutValue
-	 * accepts); pool base lives on pvdata.putvalue_slice_base. */
 	uint32_t putvalue_lkey;
 	uint32_t putvalue_slot_size;
 
-	/* submitted_count_per_peer[p] (device-owned, [nranks]) counts the writes to
-	 * peer p doorbelled by this context, across every QP. The post path's
-	 * atomicAdd returns the write's position (pseq) in that sequence, which it
-	 * stamps into req_id; FlushAsync snapshots this counter at flush time. The
-	 * host only zero-initialises it.
-	 *
-	 * ordered_completed_count_per_peer[p] (host-published, [nranks]) is the
-	 * contiguous prefix of that peer's posting sequence: N means the peer's first
-	 * N writes on this context have all completed. Wait compares its snapshot
-	 * ticket against this one number. */
 	uint32_t *submitted_count_per_peer;
 	volatile uint32_t *ordered_completed_count_per_peer;
-
-	/* Per-peer outstanding cap, in writes: the post path refuses to create the
-	 * (peer_window + 1)-th outstanding write to any single peer.
-	 *
-	 * peer_window bounds the host's per-peer completion bitmap, which only has to
-	 * cover what can be outstanding, so a fixed cap keeps the bitmap a fixed size.
-	 * pseq wraps at peer_window, so it never aliases two live writes to one peer.
-	 * peer_window is a power of two. */
 	uint32_t peer_window;
-
-	/* Every QP in this context binds one completion queue, so unread CQEs summed
-	 * across every QP must stay within the CQ depth or the ring overflows and
-	 * completions are lost silently. The device bumps submitted_count_per_ctx once
-	 * per WQE; the host publishes completed_count_per_ctx (one increment per CQE
-	 * read); put blocks while (submitted - completed) >= cq_depth.
-	 *
-	 * submitted_count_per_ctx is device-owned, one uint64 in GPU memory.
-	 * completed_count_per_ctx is host-published via gdrcopy.
-	 * cq_depth is the context's CQ num_entries. */
 	uint64_t *submitted_count_per_ctx;
 	volatile uint64_t *completed_count_per_ctx;
 	uint32_t cq_depth;
@@ -383,6 +251,21 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 
 #ifdef __cplusplus
 }
+
+#if UINTPTR_MAX == UINT64_MAX
+static_assert(sizeof(nccl_ofi_gin_gdaki_dev_endpoint_handle_v1) == 80);
+static_assert(sizeof(nccl_ofi_gin_gdaki_dev_counter_handle_v1) == 96);
+static_assert(sizeof(nccl_ofi_gin_gdaki_dev_handle_v1) == 240);
+static_assert(offsetof(nccl_ofi_gin_gdaki_dev_endpoint_handle_v1, cq) == 8);
+static_assert(offsetof(nccl_ofi_gin_gdaki_dev_endpoint_handle_v1, putvalue_slice_base) == 72);
+static_assert(offsetof(nccl_ofi_gin_gdaki_dev_handle_v1, putvalue_lkey) == 232);
+static_assert(sizeof(nccl_ofi_gin_gdaki_dev_endpoint_handle_v2) == 64);
+static_assert(sizeof(nccl_ofi_gin_gdaki_dev_counter_handle_v2) == 80);
+static_assert(sizeof(nccl_ofi_gin_gdaki_dev_handle_v2) == 256);
+static_assert(offsetof(nccl_ofi_gin_gdaki_dev_endpoint_handle_v2, local_cntr_value) == 32);
+static_assert(offsetof(nccl_ofi_gin_gdaki_dev_handle_v2, submitted_count_per_peer) == 208);
+static_assert(offsetof(nccl_ofi_gin_gdaki_dev_handle_v2, submitted_count_per_ctx) == 232);
+#endif
 #endif
 
 #endif /* NCCL_OFI_GIN_GDAKI_DEV_H_ */
