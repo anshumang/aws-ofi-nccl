@@ -489,8 +489,8 @@ static void populate_endpoint_handle(nccl_ofi_gin_gdaki_dev_endpoint_handle_v2 &
 	h.local_cntr_value = ep.base.completed_count_dev;
 	h.submitted_count = 0;
 	h.sq_size = ep.base.sq_size;
-	h.putvalue_pad = 0;
-	h.putvalue_slice_base = ep.putvalue_slice_base;
+	h.reserved0 = 0;
+	h.reserved1 = 0;
 }
 
 template <typename Handle>
@@ -542,10 +542,8 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle_v2 &h,
 	h.counter_handles = ctx->nCounters > 0 ? ctx->d_counter_handles_v2[ctx_id]->dev : nullptr;
 	h.signal_handles = ctx->nSignals > 0 ? ctx->d_signal_handles_v2[ctx_id]->dev : nullptr;
 
-	const uint16_t rail_id = (uint16_t)(ctx_id % ctx->num_rails);
-	const auto &rs = *ctx->rail_shared[rail_id];
-	h.putvalue_lkey = rs.putvalue_lkey;
-	h.putvalue_slot_size = (uint32_t)ctx->putvalue_slot_size;
+	h.reserved0 = 0;
+	h.reserved1 = 0;
 	h.submitted_count_per_peer = ctx->submitted_per_peer[ctx_id]->dev;
 	h.ordered_completed_count_per_peer =
 		ctx->completion_state.dev_ordered_completed_count_per_peer(ctx_id);
@@ -973,10 +971,10 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			      ctx->pvdata[0]->base.sq_size,
 			      ctx->pvdata[0]->base.sq_entry_size);
 
-		/* Preserve the published staging metadata in both layouts here. v1
-		 * consumes it; v2 carries PutValue inline. */
-		setup_putvalue_pool(ctx.get(), put_comm);
+		/* v1 stages PutValue through a registered source pool. v2 carries
+		 * PutValue inline and deliberately allocates no staging resources. */
 		if (backend_version == NCCL_OFI_GDAKI_BACKEND_VERSION_1) {
+			setup_putvalue_pool(ctx.get(), put_comm);
 			for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
 				populate_dev_handle(ctx->dev_handles_v1.host[ctx_id],
 						    ctx.get(),
