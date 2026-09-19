@@ -522,6 +522,20 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 	has_64_bit_req_id =
 		(sq_attr.caps & FI_EFA_WQ_CAPS_64_BIT_REQ_ID) != 0;
 #endif
+#if NCCL_OFI_GDAKI_ASSUME_64_BIT_REQ_ID
+	/* Measurement-only bypass (NCCLOFI-1945). Pretend the device echoes
+	 * 64-bit request ids so a backendVersion 2 context can be built on
+	 * firmware that does not advertise FI_EFA_WQ_CAPS_64_BIT_REQ_ID. On
+	 * such firmware the completion path cannot attribute CQEs, so this is
+	 * valid only for runs that never wait on a transmit completion
+	 * (non-transmitting attribution arms). Never ship. */
+	if (!has_64_bit_req_id) {
+		NCCL_OFI_WARN("GDAKI: device does not report 64-bit request ids; "
+			      "assuming them (NCCL_OFI_GDAKI_ASSUME_64_BIT_REQ_ID). "
+			      "Measurement-only build, completion tracking is not valid.");
+		has_64_bit_req_id = true;
+	}
+#endif
 	if (backend_version == NCCL_OFI_GDAKI_BACKEND_VERSION_2 &&
 	    !has_64_bit_req_id) {
 		throw std::runtime_error(
