@@ -452,7 +452,7 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle &h,
 	h.data.target_remote_qpns     = ctx->data[ctx_id]->base.targets.qpns.dev;
 	h.data.target_qkey            = ctx->data[ctx_id]->base.targets.qkeys.dev;
 	h.data.sq_lock = 0;
-	h.data.local_cntr_value = ctx->data[ctx_id]->local_cntr.gpu_ptr();
+	h.data.local_cntr_value = ctx->data[ctx_id]->local_cntr_ptr();
 	h.data.submitted_count = 0;
 	h.data.sq_size = ctx->data[ctx_id]->base.sq_size;
 
@@ -464,7 +464,7 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle &h,
 	h.pvdata.target_remote_qpns     = ctx->pvdata[ctx_id]->base.targets.qpns.dev;
 	h.pvdata.target_qkey            = ctx->pvdata[ctx_id]->base.targets.qkeys.dev;
 	h.pvdata.sq_lock = 0;
-	h.pvdata.local_cntr_value = ctx->pvdata[ctx_id]->local_cntr.gpu_ptr();
+	h.pvdata.local_cntr_value = ctx->pvdata[ctx_id]->local_cntr_ptr();
 	h.pvdata.submitted_count = 0;
 	h.pvdata.sq_size = ctx->pvdata[ctx_id]->base.sq_size;
 	h.pvdata.putvalue_slice_base = ctx->pvdata[ctx_id]->putvalue_slice_base;
@@ -745,6 +745,16 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		 * as nullptr (zero address). This is also the target-slot layout
 		 * of each poster's target addressing table. */
 		const size_t total_slots = 1 + (size_t)global_n_sc;
+		/* Benchmark-only counter trimming (see nccl_ofi_param.h). */
+		const bool skip_unused_cntrs = ofi_nccl_gdaki_skip_unused_hw_counters.get();
+		const bool sc_write_cntr = !(skip_unused_cntrs && config->nCounters == 0);
+		if (skip_unused_cntrs) {
+			NCCL_OFI_WARN("gin GDAKI: OFI_NCCL_GDAKI_SKIP_UNUSED_HW_COUNTERS set: "
+				      "opening %d instead of %d EFA hardware counters per context "
+				      "(no PutValue endpoint counter%s); PutValue must not be used",
+				      1 + (sc_write_cntr ? 2 : 1) * local_n_sc, 2 + 2 * local_n_sc,
+				      sc_write_cntr ? "" : ", no signal-endpoint FI_WRITE counters");
+		}
 		for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
 			/* This context's endpoints open on rail
 			 * (ctx_id % num_rails)'s domain. Distinct contextIds
@@ -774,7 +784,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			}
 			for (int i = 0; i < local_n_sc; i++) {
 				ctx->sc_endpoints[ctx_id].push_back(std::make_unique<gdaki_sc_endpoint>());
-				ctx->sc_endpoints[ctx_id][i]->open(ofi_domain, proxy_info, gda_ops);
+				ctx->sc_endpoints[ctx_id][i]->open(ofi_domain, proxy_info, gda_ops, sc_write_cntr);
 			}
 			/* Dedicated PutValue poster endpoint. */
 			/* PutValue only writes. */
@@ -782,7 +792,8 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			 * inline data, so their PutValue endpoint takes the wide entry
 			 * (at half SQ depth). Backend version 1 keeps the narrow entry. */
 			ctx->pvdata[ctx_id]->open(
-				ofi_domain, proxy_info, gda_ops, FI_WRITE, putvalue_inline_size);
+				ofi_domain, proxy_info, gda_ops, FI_WRITE, putvalue_inline_size,
+				/* with_cntr */ !skip_unused_cntrs);
 
 			/*
 			 * Step 5: Exchange ALL of this ctx's endpoint addresses in a

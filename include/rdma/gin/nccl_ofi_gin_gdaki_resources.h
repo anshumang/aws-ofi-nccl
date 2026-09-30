@@ -560,19 +560,32 @@ public:
 	gdaki_data_endpoint &operator=(const gdaki_data_endpoint &) = delete;
 
 	gdaki_hw_counter local_cntr;         /* local completion; ops per open() */
+	/* Zero word standing in for local_cntr when open() was told not to
+	 * create it (OFI_NCCL_GDAKI_SKIP_UNUSED_HW_COUNTERS). */
+	gdaki_gpu_buf<uint64_t> no_cntr_word;
 	gdaki_endpoint   base;          /* AFTER counter → EP closes first */
 
 	/**
 	 * Open the inner endpoint, create the local-completion counter, and bind
 	 * it before enabling. cntr_flags names the operations the counter counts:
 	 * FI_WRITE for an endpoint that only writes, FI_WRITE | FI_READ for one
-	 * that also issues reads.
+	 * that also issues reads. with_cntr=false skips the counter (the EP is
+	 * enabled with only its CQ) and local_cntr_ptr() then points at a zero
+	 * word — only valid for an endpoint that is never posted to.
 	 */
 	void open(struct fid_domain *domain,
 		  struct fi_info *ref_info,
 		  struct fi_efa_ops_gda *gda_ops,
 		  uint64_t cntr_flags,
-		  uint32_t inline_write_size);
+		  uint32_t inline_write_size,
+		  bool with_cntr = true);
+
+	/* GPU pointer the device reads as this EP's local completion count. */
+	volatile uint64_t *local_cntr_ptr() const
+	{
+		return local_cntr.get() ? local_cntr.gpu_ptr()
+					: static_cast<volatile uint64_t *>(no_cntr_word.dev);
+	}
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors (QP/CQ attrs,
@@ -621,6 +634,9 @@ public:
 
 	gdaki_hw_counter write_cntr;        /* FI_WRITE (local completion) */
 	gdaki_hw_counter remote_write_cntr; /* FI_REMOTE_WRITE (signal) */
+	/* Zero word standing in for write_cntr when open() was told not to
+	 * create it (OFI_NCCL_GDAKI_SKIP_UNUSED_HW_COUNTERS). */
+	gdaki_gpu_buf<uint64_t> no_write_cntr_word;
 	gdaki_endpoint   base;          /* AFTER counters → EP closes first */
 	/* counter_dev_handle exposes the WRITE (local completion) counter via cntr_value.
 	 * Returned to the kernel through counter_handles[]. */
@@ -633,10 +649,20 @@ public:
 	/**
 	 * Open the inner endpoint with hardware counters bound. Creates
 	 * the counters, opens the inner EP without enable, binds the
-	 * counters, then enables.
+	 * counters, then enables. with_write_cntr=false leaves out the
+	 * FI_WRITE counter: valid only when this EP serves as a signal target
+	 * and never as a GIN counter (a signal EP is never a local poster, so
+	 * its FI_WRITE counter never ticks).
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  struct fi_efa_ops_gda *gda_ops);
+		  struct fi_efa_ops_gda *gda_ops, bool with_write_cntr = true);
+
+	/* GPU pointer the device reads as this EP's FI_WRITE completion count. */
+	volatile uint64_t *write_cntr_ptr() const
+	{
+		return write_cntr.get() ? write_cntr.gpu_ptr()
+					: static_cast<volatile uint64_t *>(no_write_cntr_word.dev);
+	}
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors, build the

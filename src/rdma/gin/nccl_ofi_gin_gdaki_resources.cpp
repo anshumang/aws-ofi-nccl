@@ -465,16 +465,25 @@ void gdaki_data_endpoint::open(struct fid_domain *domain,
 			       struct fi_info *ref_info,
 			       struct fi_efa_ops_gda *gda_ops,
 			       uint64_t cntr_flags,
-			       uint32_t inline_write_size)
+			       uint32_t inline_write_size,
+			       bool with_cntr)
 {
 	/* Create the counter first; it will be bound to the inner endpoint
-	 * between open() and enable(). */
-	local_cntr.create(gda_ops, domain);
+	 * between open() and enable(). Without a counter the endpoint still
+	 * has its CQ, which is all libfabric needs to enable it. */
+	if (with_cntr) {
+		local_cntr.create(gda_ops, domain);
+	} else {
+		no_cntr_word.allocate(1); /* calloc'd host word, so the device reads 0 */
+		no_cntr_word.commit();
+	}
 
 	/* Open the inner endpoint without enable. */
 	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size(), inline_write_size);
 
-	base.endpoint.bind(&local_cntr.get()->fid, cntr_flags);
+	if (with_cntr) {
+		base.endpoint.bind(&local_cntr.get()->fid, cntr_flags);
+	}
 
 	base.endpoint.enable();
 }
@@ -489,11 +498,16 @@ void gdaki_data_endpoint::populate(int backend_version, struct fi_efa_ops_gda *g
 }
 
 void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			     struct fi_efa_ops_gda *gda_ops)
+			     struct fi_efa_ops_gda *gda_ops, bool with_write_cntr)
 {
 	/* Create hardware counters first; they will be bound to the inner
 	 * endpoint between open() and enable(). */
-	write_cntr.create(gda_ops, domain);
+	if (with_write_cntr) {
+		write_cntr.create(gda_ops, domain);
+	} else {
+		no_write_cntr_word.allocate(1); /* calloc'd host word, so the device reads 0 */
+		no_write_cntr_word.commit();
+	}
 	remote_write_cntr.create(gda_ops, domain);
 
 	/* Open the inner endpoint without enable. Use the same CQ sizing as
@@ -501,7 +515,9 @@ void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info
 	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size(), /* inline_write_size */ 0);
 
 	/* Bind counters before enabling. */
-	base.endpoint.bind(&write_cntr.get()->fid, FI_WRITE);
+	if (with_write_cntr) {
+		base.endpoint.bind(&write_cntr.get()->fid, FI_WRITE);
+	}
 	base.endpoint.bind(&remote_write_cntr.get()->fid, FI_REMOTE_WRITE);
 
 	base.endpoint.enable();
@@ -547,13 +563,13 @@ void gdaki_sc_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda
 	fill_common(counter_dev_handle.host[0]);
 	/* TODO: Refactor counter_dev_handle so the same gpu memory is not
 	 * being used by multiple fields */
-	counter_dev_handle.host[0].cntr_value = write_cntr.gpu_ptr();
-	counter_dev_handle.host[0].base.local_cntr_value = write_cntr.gpu_ptr();
+	counter_dev_handle.host[0].cntr_value = write_cntr_ptr();
+	counter_dev_handle.host[0].base.local_cntr_value = write_cntr_ptr();
 	counter_dev_handle.commit();
 
 	signal_dev_handle.allocate(1);
 	fill_common(signal_dev_handle.host[0]);
 	signal_dev_handle.host[0].cntr_value = remote_write_cntr.gpu_ptr();
-	signal_dev_handle.host[0].base.local_cntr_value = write_cntr.gpu_ptr();
+	signal_dev_handle.host[0].base.local_cntr_value = write_cntr_ptr();
 	signal_dev_handle.commit();
 }

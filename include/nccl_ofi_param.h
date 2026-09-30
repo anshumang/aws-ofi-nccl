@@ -398,4 +398,20 @@ OFI_NCCL_PARAM(NVTX_TRACE_DIMENSION, nvtx_trace_dimension,  "NVTX_TRACE_DIMENSIO
 OFI_NCCL_PARAM_VALUE_SET(GDAKI_EFA_HW_COUNTER, (AUTO)(ON)(OFF))
 OFI_NCCL_PARAM(GDAKI_EFA_HW_COUNTER, gdaki_efa_hw_counter, "GDAKI_EFA_HW_COUNTER", GDAKI_EFA_HW_COUNTER::AUTO)
 
+/*
+ * Benchmarking escape hatch: do not open the EFA hardware counters that a
+ * Put-only, counter-free GIN workload never reads, so more contexts fit the
+ * per-NIC counter budget (max_comp_cntr, 512 on p6). Per context the GDAKI
+ * path opens 1 counter on the data EP, 1 on the PutValue EP and 2 on each
+ * signal/counter EP; with this knob the PutValue EP counter and, when the
+ * caller requested no GIN counters, the FI_WRITE counter of each signal EP are
+ * replaced by a zero word in GPU memory. The data EP counter (SQ credit and
+ * Flush) and every FI_REMOTE_WRITE signal counter are kept, so Put, signals,
+ * barriers and Flush behave as before.
+ *
+ * NOT for production: a PutValue posted under this knob sees unlimited SQ
+ * credit and its Flush never completes. Default false.
+ */
+OFI_NCCL_PARAM(bool, gdaki_skip_unused_hw_counters, "GDAKI_SKIP_UNUSED_HW_COUNTERS", false);
+
 #endif // End NCCL_OFI_PARAM_H_
