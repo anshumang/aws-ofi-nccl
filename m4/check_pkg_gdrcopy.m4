@@ -13,7 +13,13 @@ AC_DEFUN([CHECK_PKG_GDRCOPY], [
   AC_ARG_WITH([gdrcopy],
      [AS_HELP_STRING([--with-gdrcopy=PATH], [Path to non-standard gdrcopy installation])])
 
-  AS_IF([test -z "${with_gdrcopy}" -o "${with_gdrcopy}" = "yes"],
+  dnl GDRCopy is only used by CUDA builds.  Call this macro after
+  dnl have_device_interface is set.
+  AS_IF([test "${have_device_interface}" != "cuda"],
+        [check_pkg_found=no
+         AS_IF([test -n "${with_gdrcopy}" -a "${with_gdrcopy}" != "no"],
+               [AC_MSG_WARN([GDRCopy is only used by CUDA builds; ignoring --with-gdrcopy])])],
+        [test -z "${with_gdrcopy}" -o "${with_gdrcopy}" = "yes"],
         [],
         [test "${with_gdrcopy}" = "no"],
         [check_pkg_found=no],

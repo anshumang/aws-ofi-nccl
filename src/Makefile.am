@@ -16,7 +16,6 @@ sources = \
 	nccl_ofi_api.cpp \
 	nccl_ofi_assert.cpp \
 	nccl_ofi_compat.cpp \
-	nccl_ofi_gdrcopy.cpp \
 	nccl_ofi_net.cpp \
 	nccl_ofi_sendrecv.cpp \
 	nccl_ofi_system.cpp \
@@ -50,7 +49,7 @@ sources += nccl_ofi_rocm.cpp nccl_ofi_interface_nvidia.cpp
 endif
 
 if HAVE_CUDA
-sources += nccl_ofi_cuda.cpp nccl_ofi_interface_nvidia.cpp
+sources += nccl_ofi_cuda.cpp nccl_ofi_gdrcopy.cpp nccl_ofi_interface_nvidia.cpp
 sources += \
 	rdma/gin/nccl_ofi_gin.cpp \
 	rdma/gin/nccl_ofi_gin_allgather.cpp \

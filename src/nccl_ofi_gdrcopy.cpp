@@ -12,9 +12,7 @@
 #include "nccl_ofi_log.h"
 #include "nccl_ofi_math.h"
 
-#if HAVE_CUDA
 #include "nccl_ofi_cuda.h"
-#endif
 
 #if HAVE_GDRCOPY
 
@@ -115,7 +113,6 @@ int nccl_ofi_gdrcopy_ctx::register_region(void *device_ptr, size_t size, bool pc
 	int ret = 0;
 	bool coherent = false;
 
-#if HAVE_CUDA
 	/* A C2C-selected NIC always uses the default mapping. When the selected
 	 * NIC path is PCIe, query the GPU that owns this pointer to determine
 	 * whether its default mapping must be overridden. */
@@ -127,12 +124,6 @@ int nccl_ofi_gdrcopy_ctx::register_region(void *device_ptr, size_t size, bool pc
 			return ret;
 		}
 	}
-#else
-	if (pcie_mapping) {
-		NCCL_OFI_WARN("A PCIe GDRCopy mapping requires CUDA support");
-		return -ENOTSUP;
-	}
-#endif
 
 	const bool force_pcie = pcie_mapping && coherent;
 
